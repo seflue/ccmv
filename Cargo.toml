@@ -1,0 +1,29 @@
+[package]
+name = "ccmv"
+version = "0.1.0"
+edition = "2024"
+description = "Move and rename Claude Code projects"
+license = "MIT"
+repository = "https://github.com/seflue/ccmv"
+keywords = ["claude-code", "migration", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+flate2 = "1"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+tempfile = "3"
+thiserror = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
