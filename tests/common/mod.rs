@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Creates a realistic Claude Code project structure in the given base directory.
-/// Returns (project_path, claude_home_path).
+/// Returns (`project_path`, `claude_home_path`).
 pub fn setup_claude_project(base: &Path, project_rel_path: &str) -> (PathBuf, PathBuf) {
     let project = base.join(project_rel_path);
     let claude_home = base.join(".claude");

@@ -65,6 +65,16 @@ ccmv restore ~/.claude/backups/ccmv/...-20260318-213553.tar.gz
 
 Backups contain session files, settings, and MCP config as a `.tar.gz` archive. The project directory itself is not included (use git for that).
 
+### Session-only mode
+
+```bash
+ccmv --session-only ~/myapp/.claude/worktrees/feature-x ~/myapp
+```
+
+Moves only the session data — global `projects/{encoded}/`, jsonl `cwd` fields, sessions index, `history.jsonl`, and the `~/.claude.json` trust key. Neither project directory is touched.
+
+Use case: point a session started in a git worktree back at the parent repo, then drop the worktree. The source path does not need to still exist on disk; only its session data under `~/.claude/` is required.
+
 ### Flags
 
 | Flag | Short | Description |
@@ -73,6 +83,7 @@ Backups contain session files, settings, and MCP config as a `.tar.gz` archive. 
 | `--verbose` | `-v` | Detailed output |
 | `--force` | | Overwrite if target already has Claude Code data |
 | `--no-backup` | | Skip automatic backup |
+| `--session-only` | | Migrate only session data, leave project directories untouched |
 
 Flags go before positional arguments: `ccmv -n source target`
 

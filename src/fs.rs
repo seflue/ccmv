@@ -138,6 +138,7 @@ impl MockFs {
         self.dirs.lock().unwrap().insert(path.to_path_buf());
     }
 
+    #[allow(dead_code)]
     pub fn get_file(&self, path: &Path) -> Option<String> {
         self.files.lock().unwrap().get(path).cloned()
     }

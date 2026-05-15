@@ -17,6 +17,7 @@ pub struct MigrateOpts {
     pub verbose: bool,
     pub force: bool,
     pub no_backup: bool,
+    pub session_only: bool,
 }
 
 #[derive(Debug)]
@@ -75,7 +76,9 @@ impl Command {
         // move source INTO it, just like `mv` does.
         // For idempotent re-runs (source gone): only apply mv-semantics
         // if target/name exists (i.e. a previous move used mv-semantics).
-        if target.is_dir()
+        // Skipped for --session-only: target is the literal new project path.
+        if !cli.session_only
+            && target.is_dir()
             && target != source
             && let Some(name) = source.file_name()
             && (source.is_dir() || target.join(name).exists())
@@ -90,6 +93,7 @@ impl Command {
                 verbose: cli.verbose,
                 force: cli.force,
                 no_backup: cli.no_backup,
+                session_only: cli.session_only,
             },
         })
     }
@@ -116,6 +120,7 @@ struct Migration<'a> {
     claude_home: &'a Path,
     dry_run: bool,
     no_backup: bool,
+    session_only: bool,
     old_str: String,
     new_str: String,
 }
@@ -146,7 +151,12 @@ impl<'a> Migration<'a> {
         // If neither exists, check if the migration was already completed
         // (target has the project) — support idempotent re-runs.
         if !source_state.project_dir_exists && source_state.global_project_dir.is_none() {
-            if source == target {
+            // Session-only mode: the idempotency fallback (reuse target state
+            // as source state) is unsafe here. With nothing to move on the
+            // source side, falling through would silently no-op AND, if backup
+            // is enabled, archive target's local `.claude/` — including any
+            // broken symlinks that live there. Bail clearly instead.
+            if source == target || opts.session_only {
                 bail!(
                     "source not found: {} does not exist and has no Claude Code project data",
                     source.display()
@@ -164,6 +174,7 @@ impl<'a> Migration<'a> {
                     claude_home,
                     dry_run: opts.dry_run,
                     no_backup: opts.no_backup,
+                    session_only: opts.session_only,
                     old_str,
                     new_str,
                 });
@@ -174,8 +185,9 @@ impl<'a> Migration<'a> {
             );
         }
 
-        // Conflict check
-        if source != target {
+        // Conflict check — skipped in session-only mode (target global may
+        // already exist; rename_global_dir will merge into it).
+        if source != target && !opts.session_only {
             let target_state = scanner::scan(fs, target, claude_home)?;
             if target_state.global_project_dir.is_some() && !opts.force {
                 bail!(
@@ -193,12 +205,16 @@ impl<'a> Migration<'a> {
             claude_home,
             dry_run: opts.dry_run,
             no_backup: opts.no_backup,
+            session_only: opts.session_only,
             old_str,
             new_str,
         })
     }
 
     fn run(self) -> Result<MigrationReport> {
+        if self.session_only {
+            return self.run_session_only();
+        }
         // Idempotency check
         if self.source_state.paths_consistent
             && self.source_state.project_dir_exists
@@ -246,6 +262,65 @@ impl<'a> Migration<'a> {
         })
     }
 
+    /// Session-only migration: moves global Claude Code session data
+    /// from source to target, leaving both project directories untouched.
+    fn run_session_only(self) -> Result<MigrationReport> {
+        // Pre-check 1: source must have global session data
+        if self.source_state.global_project_dir.is_none() {
+            bail!(
+                "nothing to move: no global session data for {}",
+                self.source.display()
+            );
+        }
+        // Pre-check 2: target must exist as directory (otherwise sessions would
+        // be orphaned). Only enforced when source != target.
+        if self.source != self.target && !self.fs.is_dir(self.target) {
+            bail!(
+                "target path does not exist; sessions would be orphaned: {}",
+                self.target.display()
+            );
+        }
+        // Noop: source == target
+        if self.source == self.target {
+            return Ok(MigrationReport {
+                action: "session-only-noop".to_owned(),
+                source: Some(self.source.to_path_buf()),
+                target: Some(self.target.to_path_buf()),
+                global_dir_rename: None,
+                files_updated: Vec::new(),
+                backup_path: None,
+                dry_run: self.dry_run,
+                nothing_to_do: true,
+            });
+        }
+
+        let backup_path = self.create_backup_if_needed()?;
+        let global_dir_rename = self.compute_global_rename()?;
+        self.rename_global_dir(global_dir_rename.as_ref())?;
+
+        let mut all_reports = Vec::new();
+        all_reports.extend(self.update_session_files(global_dir_rename.as_ref())?);
+        all_reports.extend(self.update_history());
+        all_reports.extend(self.update_claude_json());
+
+        // verify() is intentionally skipped — source project dir may not exist
+        // and target project dir is untouched by design.
+        if !self.dry_run {
+            eprintln!("session-only: skipping full verify; source project dir untouched");
+        }
+
+        Ok(MigrationReport {
+            action: "session-only".to_owned(),
+            source: Some(self.source.to_path_buf()),
+            target: Some(self.target.to_path_buf()),
+            global_dir_rename,
+            files_updated: all_reports,
+            backup_path,
+            dry_run: self.dry_run,
+            nothing_to_do: false,
+        })
+    }
+
     fn compute_global_rename(&self) -> Result<Option<(PathBuf, PathBuf)>> {
         if let Some(ref old_global) = self.source_state.global_project_dir {
             let new_encoded = encoder::encode(self.target)?;
@@ -266,8 +341,10 @@ impl<'a> Migration<'a> {
         {
             if self.fs.is_dir(new_global) {
                 // Target global dir already exists — merge source into it.
-                // Move each entry from source to target (overwrite on conflict),
-                // preserving any new sessions created at the target path.
+                // `sessions-index.json` is JSON-merged first so target's
+                // session entries aren't clobbered by source's index;
+                // remaining files (UUID-named) are moved by `merge_dirs`.
+                merge_sessions_index(old_global, new_global)?;
                 merge_dirs(old_global, new_global)?;
             } else {
                 self.fs
@@ -373,13 +450,8 @@ impl<'a> Migration<'a> {
     fn update_claude_json(&self) -> Vec<UpdateReport> {
         let mut reports = Vec::new();
         if let Some(ref cj) = self.source_state.claude_json
-            && let Ok(report) = updater::rename_json_keys(
-                self.fs,
-                cj,
-                &self.old_str,
-                &self.new_str,
-                self.dry_run,
-            )
+            && let Ok(report) =
+                updater::rename_json_keys(self.fs, cj, &self.old_str, &self.new_str, self.dry_run)
         {
             reports.push(report);
         }
@@ -411,8 +483,9 @@ impl<'a> Migration<'a> {
         let sub_opts = MigrateOpts {
             dry_run: self.dry_run,
             verbose: false,
-            force: true,   // sub-project target may already exist
+            force: true,     // sub-project target may already exist
             no_backup: true, // parent backup covers everything
+            session_only: false,
         };
 
         for (sub_source, sub_target) in &subprojects {
@@ -430,10 +503,7 @@ impl<'a> Migration<'a> {
     }
 
     fn move_project_dir(&self) -> Result<()> {
-        if !self.dry_run
-            && self.source != self.target
-            && self.fs.is_dir(self.source)
-        {
+        if !self.dry_run && self.source != self.target && self.fs.is_dir(self.source) {
             if self.fs.is_dir(self.target) {
                 // Target already exists (e.g. user moved manually, or previous run).
                 // Merge source into target, preserving existing files.
@@ -466,12 +536,24 @@ impl<'a> Migration<'a> {
             return Ok(None);
         }
         if let Some(ref global) = self.source_state.global_project_dir {
+            // Session-only mode leaves the source project tree untouched,
+            // so backing up `local/.claude/` and `.mcp.json` is wrong (and
+            // unsafe: local `.claude/` may contain broken symlinks). Only
+            // global/ and `.claude.json` (which IS rewritten) are archived.
+            let (local, mcp) = if self.session_only {
+                (None, None)
+            } else {
+                (
+                    self.source_state.local_claude_dir.as_deref(),
+                    self.source_state.mcp_json.as_deref(),
+                )
+            };
             return Ok(Some(backup::create_backup(
                 self.source,
                 self.claude_home,
                 global,
-                self.source_state.local_claude_dir.as_deref(),
-                self.source_state.mcp_json.as_deref(),
+                local,
+                mcp,
                 self.source_state.claude_json.as_deref(),
             )?));
         }
@@ -479,14 +561,67 @@ impl<'a> Migration<'a> {
     }
 }
 
+/// JSON-merge the `sessions-index.json` files at the top of two global dirs.
+///
+/// When both source and target global dirs contain a `sessions-index.json`,
+/// a plain file-level rename (as done by `merge_dirs`) would let source's
+/// index overwrite target's, dropping target sessions from the index even
+/// though their jsonl files survive on disk.
+///
+/// Strategy: concatenate target's `entries` array with source's entries.
+/// Session IDs are UUIDs, so duplicates effectively never occur; if they
+/// ever did, source entries would appear after target's (i.e. last-write
+/// wins, same end state as the previous rename-based behavior). Other
+/// top-level keys are taken from target (it already exists and is the
+/// "winning" location after the move).
+///
+/// After merging, the source-side file is removed so the subsequent
+/// `merge_dirs` call doesn't see it.
+fn merge_sessions_index(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    let src = src_dir.join("sessions-index.json");
+    let dst = dst_dir.join("sessions-index.json");
+    if !src.exists() {
+        return Ok(());
+    }
+    if !dst.exists() {
+        // No conflict — let `merge_dirs` handle the move.
+        return Ok(());
+    }
+
+    let src_text =
+        std::fs::read_to_string(&src).with_context(|| format!("reading {}", src.display()))?;
+    let dst_text =
+        std::fs::read_to_string(&dst).with_context(|| format!("reading {}", dst.display()))?;
+    let src_v: serde_json::Value =
+        serde_json::from_str(&src_text).with_context(|| format!("parsing {}", src.display()))?;
+    let mut dst_v: serde_json::Value =
+        serde_json::from_str(&dst_text).with_context(|| format!("parsing {}", dst.display()))?;
+
+    let src_entries = src_v
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    match dst_v.get_mut("entries").and_then(|v| v.as_array_mut()) {
+        Some(dst_entries) => dst_entries.extend(src_entries),
+        None => {
+            dst_v["entries"] = serde_json::Value::Array(src_entries);
+        }
+    }
+
+    let merged = serde_json::to_string(&dst_v).context("serializing merged sessions-index.json")?;
+    std::fs::write(&dst, merged).with_context(|| format!("writing merged {}", dst.display()))?;
+    std::fs::remove_file(&src).with_context(|| format!("removing source {}", src.display()))?;
+    Ok(())
+}
+
 /// Merge contents of `src` directory into `dst`, recursively.
 /// Files in `src` overwrite same-named files in `dst`.
 /// Files in `dst` that don't exist in `src` are preserved.
 /// After merging, `src` is removed.
 fn merge_dirs(src: &Path, dst: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(src)
-        .with_context(|| format!("reading {}", src.display()))?
-    {
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
@@ -503,8 +638,7 @@ fn merge_dirs(src: &Path, dst: &Path) -> Result<()> {
                 .with_context(|| format!("moving {}", src_path.display()))?;
         }
     }
-    std::fs::remove_dir(src)
-        .with_context(|| format!("removing empty {}", src.display()))?;
+    std::fs::remove_dir(src).with_context(|| format!("removing empty {}", src.display()))?;
     Ok(())
 }
 
@@ -578,6 +712,7 @@ mod tests {
             verbose: false,
             force: false,
             no_backup: true,
+            session_only: false,
         }
     }
 
@@ -587,6 +722,7 @@ mod tests {
             verbose: false,
             force: false,
             no_backup: true,
+            session_only: false,
         }
     }
 
@@ -788,4 +924,472 @@ mod tests {
         assert!(session.contains("/home/user/new-project"));
     }
 
+    fn session_only_opts() -> MigrateOpts {
+        MigrateOpts {
+            dry_run: false,
+            verbose: false,
+            force: false,
+            no_backup: true,
+            session_only: true,
+        }
+    }
+
+    fn session_only_dry_opts() -> MigrateOpts {
+        MigrateOpts {
+            dry_run: true,
+            verbose: false,
+            force: false,
+            no_backup: true,
+            session_only: true,
+        }
+    }
+
+    /// Sets up only the global session data + history + .claude.json for `source`.
+    /// Does not create the project directory itself (caller decides).
+    fn setup_session_data(fs: &MockFs, source: &str, claude_home: &str) {
+        let project = Path::new(source);
+        let home = Path::new(claude_home);
+        let encoded = crate::encoder::encode(project).unwrap();
+        let global = home.join("projects").join(&encoded);
+        fs.add_dir(&global);
+        fs.add_file(
+            &global.join("session.jsonl"),
+            &format!(r#"{{"cwd":"{source}"}}"#),
+        );
+        fs.add_file(
+            &global.join("sessions-index.json"),
+            &format!(r#"{{"entries":[{{"projectPath":"{source}"}}]}}"#),
+        );
+        fs.add_file(
+            &home.join("history.jsonl"),
+            &format!(r#"{{"project":"{source}"}}"#),
+        );
+        if let Some(parent) = home.parent() {
+            fs.add_file(
+                &parent.join(".claude.json"),
+                &format!(r#"{{"{source}":{{"trust":true}}}}"#),
+            );
+        }
+    }
+
+    #[test]
+    fn session_only_renames_global_dir() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+        assert!(!report.nothing_to_do);
+
+        let old_encoded = crate::encoder::encode(Path::new(source)).unwrap();
+        let new_encoded = crate::encoder::encode(Path::new(target)).unwrap();
+        assert!(!fs.exists(&claude_home.join("projects").join(&old_encoded)));
+        assert!(fs.is_dir(&claude_home.join("projects").join(&new_encoded)));
+    }
+
+    #[test]
+    fn session_only_updates_session_jsonl_cwd() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let new_encoded = crate::encoder::encode(Path::new(target)).unwrap();
+        let session = fs
+            .read_to_string(
+                &claude_home
+                    .join("projects")
+                    .join(&new_encoded)
+                    .join("session.jsonl"),
+            )
+            .unwrap();
+        assert!(session.contains(target));
+        assert!(!session.contains(source));
+    }
+
+    #[test]
+    fn session_only_updates_sessions_index() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let new_encoded = crate::encoder::encode(Path::new(target)).unwrap();
+        let idx = fs
+            .read_to_string(
+                &claude_home
+                    .join("projects")
+                    .join(&new_encoded)
+                    .join("sessions-index.json"),
+            )
+            .unwrap();
+        assert!(idx.contains(target));
+        assert!(!idx.contains(source));
+    }
+
+    #[test]
+    fn session_only_updates_history_jsonl() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let history = fs
+            .read_to_string(&claude_home.join("history.jsonl"))
+            .unwrap();
+        assert!(history.contains(target));
+        assert!(!history.contains(source));
+    }
+
+    #[test]
+    fn session_only_does_not_touch_source_project_dir() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        // local files inside source — must remain unchanged
+        fs.add_dir(&Path::new(source).join(".claude"));
+        let settings_path = Path::new(source).join(".claude/settings.json");
+        let settings_content = r#"{"keep":"me"}"#;
+        fs.add_file(&settings_path, settings_content);
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        assert!(fs.is_dir(Path::new(source)));
+        assert!(fs.is_dir(&Path::new(source).join(".claude")));
+        assert_eq!(fs.read_to_string(&settings_path).unwrap(), settings_content);
+    }
+
+    #[test]
+    fn session_only_does_not_touch_target_project_dir() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        // existing unrelated file inside target — must remain unchanged
+        let existing = Path::new(target).join("README.md");
+        let existing_content = r"# target stays";
+        fs.add_file(&existing, existing_content);
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        assert!(fs.is_dir(Path::new(target)));
+        assert_eq!(fs.read_to_string(&existing).unwrap(), existing_content);
+        // No .claude or settings.json injected into target
+        assert!(!fs.exists(&Path::new(target).join(".claude/settings.json")));
+    }
+
+    #[test]
+    fn session_only_noop_when_source_equals_target() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(source),
+            opts: session_only_opts(),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+        assert!(report.nothing_to_do);
+        assert_eq!(report.action, "session-only-noop");
+    }
+
+    #[test]
+    fn session_only_errors_when_target_path_missing() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/old";
+        let target = "/home/user/missing";
+        fs.add_dir(Path::new(source));
+        // NOTE: target NOT added
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        let err = cmd.execute(&fs, claude_home).unwrap_err();
+        assert!(err.to_string().contains("target path does not exist"));
+    }
+
+    #[test]
+    fn session_only_errors_when_source_has_no_sessions() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/empty";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        // NOTE: no setup_session_data — source has no global session data
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        let err = cmd.execute(&fs, claude_home).unwrap_err();
+        let msg = err.to_string();
+        // Either bail in Migration::new (no project/global at source) or
+        // in run_session_only's pre-check; both communicate the same idea.
+        assert!(
+            msg.contains("nothing to move") || msg.contains("source not found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn session_only_dry_run_makes_no_changes() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let old_encoded = crate::encoder::encode(Path::new(source)).unwrap();
+        let old_global = claude_home.join("projects").join(&old_encoded);
+        let session_before = fs
+            .read_to_string(&old_global.join("session.jsonl"))
+            .unwrap();
+        let history_before = fs
+            .read_to_string(&claude_home.join("history.jsonl"))
+            .unwrap();
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_dry_opts(),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+        assert!(report.dry_run);
+
+        // Old global still in place
+        assert!(fs.is_dir(&old_global));
+        let new_encoded = crate::encoder::encode(Path::new(target)).unwrap();
+        assert!(!fs.exists(&claude_home.join("projects").join(&new_encoded)));
+        // Files unchanged
+        assert_eq!(
+            fs.read_to_string(&old_global.join("session.jsonl"))
+                .unwrap(),
+            session_before
+        );
+        assert_eq!(
+            fs.read_to_string(&claude_home.join("history.jsonl"))
+                .unwrap(),
+            history_before
+        );
+    }
+
+    // NOTE: `session_only_merges_into_existing_target_global` is intentionally
+    // covered as an E2E test (Phase 3), because `merge_dirs` is implemented
+    // against real `std::fs` (not the `Fs` trait) and cannot be exercised
+    // via `MockFs`.
+
+    /// Bug 1: in session-only mode, when neither source dir nor source
+    /// global data exist, `Migration::new` must NOT silently fall back to
+    /// scanning the target and reusing its state as `source_state`. That
+    /// would cause the run to "succeed" while actually doing nothing — and
+    /// worse, would mark target's local `.claude/` for backup (Bug 2).
+    /// The correct behavior is to bail with "source not found".
+    #[test]
+    fn session_only_bails_when_source_has_no_data_even_if_target_does() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/gone/proj";
+        let target = "/home/user/proj";
+        // Source has NO project dir and NO global dir.
+        // Target exists AND has its own session data.
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, target, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        let err = cmd.execute(&fs, claude_home).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source not found") || msg.contains("nothing to move"),
+            "expected source-not-found bail, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn session_only_no_backup_skips_backup() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        fs.add_dir(Path::new(source));
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(), // no_backup = true
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+        assert!(report.backup_path.is_none());
+    }
+
+    #[test]
+    fn session_only_works_when_source_dir_already_deleted() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let source = "/home/user/.claude/worktrees/branch1/proj";
+        let target = "/home/user/proj";
+        // NOTE: source dir NOT added — worktree deleted
+        fs.add_dir(Path::new(target));
+        setup_session_data(&fs, source, "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            opts: session_only_opts(),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+        assert!(!report.nothing_to_do);
+
+        // .claude.json key renamed
+        let cj = fs
+            .read_to_string(Path::new("/home/user/.claude.json"))
+            .unwrap();
+        assert!(cj.contains(target));
+        assert!(!cj.contains(source));
+
+        // Global dir moved
+        let new_encoded = crate::encoder::encode(Path::new(target)).unwrap();
+        assert!(fs.is_dir(&claude_home.join("projects").join(&new_encoded)));
+    }
+
+    #[test]
+    fn from_cli_propagates_session_only_and_skips_mv_semantics() {
+        // tmpdir for an existing target directory
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().to_path_buf();
+        let source = tmp.path().join("worktree-src");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let cli = crate::cli::Cli {
+            command: None,
+            source: Some(source.clone()),
+            target: Some(target_dir.clone()),
+            dry_run: false,
+            verbose: false,
+            force: false,
+            no_backup: false,
+            session_only: true,
+        };
+
+        let cmd = Command::from_cli(&cli).unwrap();
+        match cmd {
+            Command::Move {
+                source: s,
+                target: t,
+                opts,
+            } => {
+                assert!(opts.session_only);
+                let canon_source = std::fs::canonicalize(&source).unwrap();
+                let canon_target = std::fs::canonicalize(&target_dir).unwrap();
+                assert_eq!(s, canon_source);
+                // mv-semantics MUST NOT have appended source name to target
+                assert_eq!(t, canon_target);
+            }
+            _ => panic!("expected Move"),
+        }
+    }
+
+    #[test]
+    fn from_cli_without_session_only_still_applies_mv_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().to_path_buf();
+        let source = tmp.path().join("myproj");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let cli = crate::cli::Cli {
+            command: None,
+            source: Some(source.clone()),
+            target: Some(target_dir.clone()),
+            dry_run: false,
+            verbose: false,
+            force: false,
+            no_backup: false,
+            session_only: false,
+        };
+
+        let cmd = Command::from_cli(&cli).unwrap();
+        match cmd {
+            Command::Move {
+                target: t, opts, ..
+            } => {
+                assert!(!opts.session_only);
+                let canon_target = std::fs::canonicalize(&target_dir).unwrap();
+                // mv-semantics: target should now be target_dir/myproj
+                assert_eq!(t, canon_target.join("myproj"));
+            }
+            _ => panic!("expected Move"),
+        }
+    }
 }

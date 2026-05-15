@@ -58,7 +58,10 @@ fn e2e_move_preserves_other_projects() {
     let claude_json = fs::read_to_string(tmp.path().join(".claude.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&claude_json).unwrap();
 
-    assert!(parsed.get(&new_path).is_some(), "moved project should have new key");
+    assert!(
+        parsed.get(&new_path).is_some(),
+        "moved project should have new key"
+    );
     assert!(parsed.get(&old_path).is_none(), "old key should be gone");
     assert!(
         parsed.get(&other_path).is_some(),

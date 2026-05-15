@@ -385,14 +385,8 @@ mod tests {
             r#"{"/old":{"trust":true},"/old/sub":{"trust":true},"/other":{"trust":true}}"#,
         );
 
-        let report = rename_json_keys(
-            &fs,
-            Path::new("/home/.claude.json"),
-            "/old",
-            "/new",
-            false,
-        )
-        .unwrap();
+        let report =
+            rename_json_keys(&fs, Path::new("/home/.claude.json"), "/old", "/new", false).unwrap();
 
         assert_eq!(report.replacements, 2);
 
@@ -411,14 +405,8 @@ mod tests {
         let original = r#"{"/unrelated":{"trust":true}}"#;
         fs.add_file(Path::new("/home/.claude.json"), original);
 
-        let report = rename_json_keys(
-            &fs,
-            Path::new("/home/.claude.json"),
-            "/old",
-            "/new",
-            false,
-        )
-        .unwrap();
+        let report =
+            rename_json_keys(&fs, Path::new("/home/.claude.json"), "/old", "/new", false).unwrap();
 
         assert_eq!(report.replacements, 0);
         assert!(report.skipped);
@@ -430,14 +418,8 @@ mod tests {
         let original = r#"{"/old":{"trust":true}}"#;
         fs.add_file(Path::new("/home/.claude.json"), original);
 
-        let report = rename_json_keys(
-            &fs,
-            Path::new("/home/.claude.json"),
-            "/old",
-            "/new",
-            true,
-        )
-        .unwrap();
+        let report =
+            rename_json_keys(&fs, Path::new("/home/.claude.json"), "/old", "/new", true).unwrap();
 
         assert_eq!(report.replacements, 1);
         assert!(!report.skipped);

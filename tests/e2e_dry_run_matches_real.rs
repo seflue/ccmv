@@ -76,8 +76,7 @@ fn e2e_dry_run_matches_real_run() {
         let real_count = extract_replacement_count(real_line);
         assert_eq!(
             dry_count, real_count,
-            "File {} has different replacement counts: dry={}, real={}",
-            i, dry_count, real_count
+            "File {i} has different replacement counts: dry={dry_count}, real={real_count}"
         );
     }
 }

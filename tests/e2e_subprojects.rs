@@ -60,8 +60,20 @@ fn e2e_move_migrates_subproject() {
     let claude_json = fs::read_to_string(tmp.path().join(".claude.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&claude_json).unwrap();
 
-    assert!(parsed.get(&new_parent).is_some(), "parent key should be updated");
-    assert!(parsed.get(&new_child).is_some(), "child key should be updated");
-    assert!(parsed.get(&old_parent).is_none(), "old parent key should be gone");
-    assert!(parsed.get(&old_child).is_none(), "old child key should be gone");
+    assert!(
+        parsed.get(&new_parent).is_some(),
+        "parent key should be updated"
+    );
+    assert!(
+        parsed.get(&new_child).is_some(),
+        "child key should be updated"
+    );
+    assert!(
+        parsed.get(&old_parent).is_none(),
+        "old parent key should be gone"
+    );
+    assert!(
+        parsed.get(&old_child).is_none(),
+        "old child key should be gone"
+    );
 }

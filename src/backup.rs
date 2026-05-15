@@ -79,8 +79,7 @@ pub fn create_backup(
     if let Some(cj) = claude_json
         && cj.is_file()
     {
-        let content =
-            std::fs::read(cj).with_context(|| format!("reading {}", cj.display()))?;
+        let content = std::fs::read(cj).with_context(|| format!("reading {}", cj.display()))?;
         append_bytes(&mut builder, "claude.json", &content)?;
     }
 
@@ -161,8 +160,28 @@ fn append_dir_recursive(
             )
         })?;
         let archive_path = archive_prefix.join(relative);
-        let content =
-            std::fs::read(&entry).with_context(|| format!("reading {}", entry.display()))?;
+        // Skip broken symlinks: `read` follows symlinks, so a dangling link
+        // would otherwise abort the whole backup. Use `symlink_metadata` to
+        // detect symlinks without following, then check the resolved target.
+        let is_symlink =
+            std::fs::symlink_metadata(&entry).is_ok_and(|m| m.file_type().is_symlink());
+        if is_symlink && !entry.exists() {
+            eprintln!("warning: skipping broken symlink {}", entry.display());
+            continue;
+        }
+        let content = match std::fs::read(&entry) {
+            Ok(c) => c,
+            Err(e) if is_symlink => {
+                eprintln!(
+                    "warning: skipping unreadable symlink {}: {e}",
+                    entry.display()
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("reading {}", entry.display())));
+            }
+        };
         append_bytes(builder, &archive_path.to_string_lossy(), &content)?;
     }
     Ok(())
@@ -296,6 +315,38 @@ mod tests {
         );
         assert!(project.join(".claude/settings.json").exists());
         assert!(project.join(".mcp.json").exists());
+    }
+
+    /// Bug 3: `append_dir_recursive` used `std::fs::read` which follows
+    /// symlinks. A broken symlink under the local `.claude/` tree (common
+    /// e.g. when skills were removed but symlinks remain) would abort the
+    /// whole backup. Broken symlinks must be skipped with a warning.
+    #[cfg(unix)]
+    #[test]
+    fn create_backup_skips_broken_symlinks_in_local_claude_dir() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, claude_home) = setup_test_project(tmp.path());
+        let encoded = crate::encoder::encode(&project).unwrap();
+        let global_dir = claude_home.join("projects").join(&encoded);
+
+        // Add a broken symlink inside .claude/
+        let skills = project.join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
+        symlink("/nonexistent/target", skills.join("broken-link")).unwrap();
+
+        // Must succeed — broken symlink is skipped, not propagated.
+        let backup_path = create_backup(
+            &project,
+            &claude_home,
+            &global_dir,
+            Some(&project.join(".claude")),
+            Some(&project.join(".mcp.json")),
+            None,
+        )
+        .unwrap();
+        assert!(backup_path.exists());
     }
 
     #[test]
