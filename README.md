@@ -1,5 +1,6 @@
 # ccmv — Move and rename Claude Code projects
 
+[![Crates.io](https://img.shields.io/crates/v/ccmv.svg)](https://crates.io/crates/ccmv)
 [![CI](https://github.com/seflue/ccmv/actions/workflows/ci.yml/badge.svg)](https://github.com/seflue/ccmv/actions/workflows/ci.yml)
 
 Move or rename [Claude Code](https://docs.anthropic.com/en/docs/claude-code) projects without losing conversation history or settings.
