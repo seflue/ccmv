@@ -2,6 +2,7 @@
 name = "ccmv"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Move and rename Claude Code projects"
 license = "MIT"
 repository = "https://github.com/seflue/ccmv"
