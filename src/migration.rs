@@ -821,26 +821,12 @@ impl<'a> Migration<'a> {
             .par_iter()
             .filter(|unit| !unit.nothing_to_do)
             .filter_map(|unit| {
-                let global = unit.state.global_project_dir.as_ref()?;
-                // Session-only mode leaves the source project tree untouched,
-                // so backing up `local/.claude/` and `.mcp.json` is wrong (and
-                // unsafe: local `.claude/` may contain broken symlinks). Only
-                // global/ and `.claude.json` (which IS rewritten) are archived.
-                let (local, mcp) = if self.session_only {
-                    (None, None)
-                } else {
-                    (
-                        unit.state.local_claude_dir.as_deref(),
-                        unit.state.mcp_json.as_deref(),
-                    )
-                };
+                unit.state.global_project_dir.as_ref()?;
                 Some(backup::create_backup(
                     &unit.source,
                     self.claude_home,
-                    global,
-                    local,
-                    mcp,
-                    self.claude_json.as_deref(),
+                    &unit.state,
+                    !self.session_only,
                 ))
             })
             .collect()
@@ -965,18 +951,11 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 fn execute_backup(fs: &dyn Fs, path: &Path, claude_home: &Path) -> Result<MigrationReport> {
     let state = scanner::scan(fs, path, claude_home)?;
-    let global = state
-        .global_project_dir
-        .context("no global project directory found; nothing to back up")?;
+    if state.global_project_dir.is_none() {
+        bail!("no global project directory found; nothing to back up");
+    }
 
-    let backup_path = backup::create_backup(
-        path,
-        claude_home,
-        &global,
-        state.local_claude_dir.as_deref(),
-        state.mcp_json.as_deref(),
-        state.claude_json.as_deref(),
-    )?;
+    let backup_path = backup::create_backup(path, claude_home, &state, true)?;
 
     Ok(MigrationReport {
         action: "backup".to_owned(),

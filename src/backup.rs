@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tar::{Archive, Builder, Header};
 
 use crate::encoder;
+use crate::scanner;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BackupManifest {
@@ -20,17 +21,27 @@ pub struct BackupManifest {
     pub version: String,
 }
 
-/// Creates a tar.gz backup of all Claude Code references for a project.
-/// Returns the path to the created backup file.
-/// Location: `{claude_home}/backups/ccmv/{encoded}-{YYYYMMDD-HHMMSS}.tar.gz`
+/// Archives what `state` found, at
+/// `{claude_home}/backups/ccmv/{encoded}-{YYYYMMDD-HHMMSS}.tar.gz`, named
+/// after `project_path`.
+///
+/// `include_local` covers the project's own tree. A session-only move leaves
+/// that tree untouched, and archiving it is not merely pointless there: a
+/// local `.claude/` may hold broken symlinks.
 pub fn create_backup(
     project_path: &Path,
     claude_home: &Path,
-    global_project_dir: &Path,
-    local_claude_dir: Option<&Path>,
-    mcp_json: Option<&Path>,
-    claude_json: Option<&Path>,
+    state: &scanner::ProjectState,
+    include_local: bool,
 ) -> Result<PathBuf> {
+    let global_project_dir = state.global_project_dir.as_deref();
+    let (local_claude_dir, mcp_json) = if include_local {
+        (state.local_claude_dir.as_deref(), state.mcp_json.as_deref())
+    } else {
+        (None, None)
+    };
+    let claude_json = state.claude_json.as_deref();
+
     let backup_dir = claude_home.join("backups/ccmv");
     std::fs::create_dir_all(&backup_dir)
         .with_context(|| format!("creating backup directory {}", backup_dir.display()))?;
@@ -56,8 +67,10 @@ pub fn create_backup(
     append_bytes(&mut builder, "manifest.json", manifest_json.as_bytes())?;
 
     // Global project directory contents
-    if global_project_dir.is_dir() {
-        append_dir_recursive(&mut builder, global_project_dir, Path::new("global"))?;
+    if let Some(global) = global_project_dir
+        && global.is_dir()
+    {
+        append_dir_recursive(&mut builder, global, Path::new("global"))?;
     }
 
     // Local .claude/ directory
@@ -255,20 +268,22 @@ mod tests {
         (project, claude_home)
     }
 
+    /// What the migration hands `create_backup`, rather than paths assembled
+    /// by hand next to it.
+    fn state_of(project: &Path, claude_home: &Path) -> scanner::ProjectState {
+        scanner::scan(&crate::fs::RealFs, project, claude_home).unwrap()
+    }
+
     #[test]
     fn create_backup_produces_archive() {
         let tmp = tempfile::tempdir().unwrap();
         let (project, claude_home) = setup_test_project(tmp.path());
-        let encoded = crate::encoder::encode(&project).unwrap();
-        let global_dir = claude_home.join("projects").join(&encoded);
 
         let backup_path = create_backup(
             &project,
             &claude_home,
-            &global_dir,
-            Some(&project.join(".claude")),
-            Some(&project.join(".mcp.json")),
-            None,
+            &state_of(&project, &claude_home),
+            true,
         )
         .unwrap();
 
@@ -289,10 +304,8 @@ mod tests {
         let backup_path = create_backup(
             &project,
             &claude_home,
-            &global_dir,
-            Some(&project.join(".claude")),
-            Some(&project.join(".mcp.json")),
-            None,
+            &state_of(&project, &claude_home),
+            true,
         )
         .unwrap();
 
@@ -328,8 +341,6 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let (project, claude_home) = setup_test_project(tmp.path());
-        let encoded = crate::encoder::encode(&project).unwrap();
-        let global_dir = claude_home.join("projects").join(&encoded);
 
         // Add a broken symlink inside .claude/
         let skills = project.join(".claude/skills");
@@ -340,10 +351,8 @@ mod tests {
         let backup_path = create_backup(
             &project,
             &claude_home,
-            &global_dir,
-            Some(&project.join(".claude")),
-            Some(&project.join(".mcp.json")),
-            None,
+            &state_of(&project, &claude_home),
+            true,
         )
         .unwrap();
         assert!(backup_path.exists());
@@ -364,10 +373,8 @@ mod tests {
         let backup_path = create_backup(
             &project,
             &claude_home,
-            &global_dir,
-            None, // no local .claude/
-            None, // no .mcp.json
-            None, // no .claude.json
+            &state_of(&project, &claude_home),
+            true,
         )
         .unwrap();
 
