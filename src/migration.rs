@@ -1,37 +1,45 @@
 // Migration: core orchestration with idempotent migration logic
 
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 
 use crate::backup;
+use crate::batch;
 use crate::encoder;
 use crate::fs::Fs;
 use crate::scanner;
 use crate::updater::{self, Substitutions, UpdateReport};
 
 /// Where a project's global session directory moves, as `(old, new)`.
-type GlobalRename = (PathBuf, PathBuf);
+pub type GlobalRename = (PathBuf, PathBuf);
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct MigrateOpts {
     pub dry_run: bool,
-    #[allow(dead_code)]
-    pub verbose: bool,
     pub force: bool,
     pub no_backup: bool,
     pub session_only: bool,
 }
 
+/// What became of one project. A run reports one of these per move, so a
+/// batch names every project instead of collapsing to a count.
+#[derive(Debug)]
+pub struct MoveReport {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub global_dir_rename: Option<GlobalRename>,
+}
+
 #[derive(Debug)]
 pub struct MigrationReport {
     pub action: String,
-    pub source: Option<PathBuf>,
-    pub target: Option<PathBuf>,
-    pub global_dir_rename: Option<(PathBuf, PathBuf)>,
+    pub moves: Vec<MoveReport>,
     pub files_updated: Vec<UpdateReport>,
-    pub backup_path: Option<PathBuf>,
+    pub backup_paths: Vec<PathBuf>,
     pub dry_run: bool,
     pub nothing_to_do: bool,
 }
@@ -40,6 +48,10 @@ pub enum Command {
     Move {
         source: PathBuf,
         target: PathBuf,
+        opts: MigrateOpts,
+    },
+    Batch {
+        moves: Vec<batch::Move>,
         opts: MigrateOpts,
     },
     Backup {
@@ -66,40 +78,87 @@ impl Command {
             };
         }
 
-        let Some(ref source_arg) = cli.source else {
-            bail!("missing <SOURCE> and <TARGET> arguments\n\nUsage: ccmv <SOURCE> <TARGET>");
-        };
-        let Some(ref target_arg) = cli.target else {
-            bail!("missing <TARGET> argument\n\nUsage: ccmv <SOURCE> <TARGET>");
+        let opts = MigrateOpts {
+            dry_run: cli.dry_run,
+            force: cli.force,
+            no_backup: cli.no_backup,
+            session_only: cli.session_only,
         };
 
-        let source = std::fs::canonicalize(source_arg)
-            .or_else(|_| std::path::absolute(source_arg).map(|p| normalize_path(&p)))?;
-        let mut target = normalize_path(&std::path::absolute(target_arg)?);
-        // mv-semantics: if target is existing dir (and not source itself),
-        // move source INTO it, just like `mv` does.
-        // For idempotent re-runs (source gone): only apply mv-semantics
-        // if target/name exists (i.e. a previous move used mv-semantics).
-        // Skipped for --session-only: target is the literal new project path.
-        if !cli.session_only
-            && target.is_dir()
-            && target != source
-            && let Some(name) = source.file_name()
-            && (source.is_dir() || target.join(name).exists())
-        {
-            target = target.join(name);
+        if let Some(ref batch_file) = cli.batch {
+            let input = read_batch_input(batch_file)?;
+            let moves = batch::parse(&input)?
+                .into_iter()
+                .map(|raw| {
+                    Ok(batch::Move {
+                        source: resolve_source(Path::new(&raw.source))?,
+                        // No mv-semantics here: a batch line states the target
+                        // outright, so appending the source name would be wrong.
+                        target: normalize_path(&std::path::absolute(&raw.target)?),
+                        line: Some(raw.line),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Self::Batch { moves, opts });
         }
-        Ok(Self::Move {
-            source,
-            target,
-            opts: MigrateOpts {
-                dry_run: cli.dry_run,
-                verbose: cli.verbose,
-                force: cli.force,
-                no_backup: cli.no_backup,
-                session_only: cli.session_only,
-            },
-        })
+
+        match cli.paths.as_slice() {
+            [] => bail!(
+                "missing <SOURCE> and <TARGET> arguments\n\nUsage: ccmv <SOURCE>... <TARGET>\n       ccmv --batch <FILE>"
+            ),
+            [_] => bail!(
+                "missing <TARGET> argument\n\nUsage: ccmv <SOURCE>... <TARGET>\n       ccmv --batch <FILE>"
+            ),
+            [source_arg, target_arg] => {
+                let source = resolve_source(source_arg)?;
+                let mut target = normalize_path(&std::path::absolute(target_arg)?);
+                // mv-semantics: if target is existing dir (and not source itself),
+                // move source INTO it, just like `mv` does.
+                // For idempotent re-runs (source gone): only apply mv-semantics
+                // if target/name exists (i.e. a previous move used mv-semantics).
+                // Skipped for --session-only: target is the literal new project path.
+                if !cli.session_only
+                    && target.is_dir()
+                    && target != source
+                    && let Some(name) = source.file_name()
+                    && (source.is_dir() || target.join(name).exists())
+                {
+                    target = target.join(name);
+                }
+                Ok(Self::Move {
+                    source,
+                    target,
+                    opts,
+                })
+            }
+            // Several sources leave no room for the rename reading of `mv`, so
+            // the target has to be a directory each source lands in. That also
+            // makes `--session-only` append the name here while the two-path
+            // form treats the target as literal — the same split `mv` makes
+            // between renaming and moving into a directory.
+            [source_args @ .., target_arg] => {
+                let dir = normalize_path(&std::path::absolute(target_arg)?);
+                if !dir.is_dir() {
+                    bail!("target is not a directory: {}", dir.display());
+                }
+                let moves = source_args
+                    .iter()
+                    .map(|source_arg| {
+                        let source = resolve_source(source_arg)?;
+                        let name = source
+                            .file_name()
+                            .with_context(|| format!("source has no name: {}", source.display()))?
+                            .to_owned();
+                        Ok(batch::Move {
+                            target: dir.join(name),
+                            source,
+                            line: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Self::Batch { moves, opts })
+            }
+        }
     }
 
     /// Execute this command, producing a `MigrationReport`.
@@ -109,213 +168,275 @@ impl Command {
                 source,
                 target,
                 opts,
-            } => Migration::new(fs, &source, &target, claude_home, &opts)?.run(),
+            } => Migration::new(fs, &[(source, target)], claude_home, &opts)?.run(),
+            Self::Batch { moves, opts } => execute_batch(fs, moves, claude_home, &opts),
             Self::Backup { path } => execute_backup(fs, &path, claude_home),
             Self::Restore { backup_file } => execute_restore(&backup_file),
         }
     }
 }
 
-struct Migration<'a> {
-    fs: &'a dyn Fs,
-    source: &'a Path,
-    target: &'a Path,
-    source_state: scanner::ProjectState,
-    claude_home: &'a Path,
-    dry_run: bool,
-    no_backup: bool,
-    session_only: bool,
-    old_str: String,
-    new_str: String,
-    /// Applied to every file this migration rewrites, in one pass each.
-    subs: Substitutions,
+/// One project on the move, with everything the run needs scanned before the
+/// first write.
+struct Unit {
+    source: PathBuf,
+    target: PathBuf,
+    state: scanner::ProjectState,
     /// Projects nested under `source`, as `(scanned state, new path)`. Empty
     /// until `run` discovers them; session-only moves never populate it.
     subprojects: Vec<(scanner::ProjectState, PathBuf)>,
+    /// Already where it belongs, with consistent references. `active()`
+    /// filters it out of every step that walks the units. It contributes no
+    /// substitution either, but for a separate reason: `subs` is built before
+    /// this flag exists and drops moves onto themselves.
+    nothing_to_do: bool,
+}
+
+impl Unit {
+    /// Takes a state that has already been scanned, as the batch path does:
+    /// its plan validation walks every source anyway.
+    fn from_state(source: &Path, target: &Path, state: scanner::ProjectState) -> Result<Self> {
+        require_absolute(source, target)?;
+
+        Ok(Self {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+            state,
+            subprojects: Vec::new(),
+            nothing_to_do: false,
+        })
+    }
+
+    fn scan(
+        fs: &dyn Fs,
+        source: &Path,
+        target: &Path,
+        claude_home: &Path,
+        opts: &MigrateOpts,
+    ) -> Result<Self> {
+        require_absolute(source, target)?;
+
+        let source_state = scanner::scan(fs, source, claude_home)?;
+        // Source must exist as a directory OR have global Claude data. If
+        // neither does, the migration may already have completed — fall back
+        // to the target's state so an idempotent re-run still finds the
+        // remaining work (e.g. `.claude.json` keys).
+        let state = if source_state.has_claude_data() {
+            // Conflict check — skipped in session-only mode (target global may
+            // already exist; rename_global_dir will merge into it).
+            if source != target && !opts.session_only {
+                let target_state = scanner::scan(fs, target, claude_home)?;
+                if target_state.global_project_dir.is_some() && !opts.force {
+                    bail!("{}", scanner::occupied_target_error(target));
+                }
+            }
+            source_state
+        } else {
+            // Session-only mode: that fallback is unsafe here. With nothing to
+            // move on the source side, falling through would silently no-op
+            // AND, if backup is enabled, archive target's local `.claude/` —
+            // including any broken symlinks that live there.
+            if source == target || opts.session_only {
+                bail!("{}", scanner::missing_source_error(source));
+            }
+            let target_state = scanner::scan(fs, target, claude_home)?;
+            if !target_state.has_claude_data() {
+                bail!("{}", scanner::missing_source_error(source));
+            }
+            target_state
+        };
+
+        Self::from_state(source, target, state)
+    }
+}
+
+fn require_absolute(source: &Path, target: &Path) -> Result<()> {
+    if !source.is_absolute() {
+        bail!("source path must be absolute, got: {}", source.display());
+    }
+    if !target.is_absolute() {
+        bail!("target path must be absolute, got: {}", target.display());
+    }
+    Ok(())
+}
+
+/// One run over any number of moves.
+///
+/// Each unit owns disjoint work — its global session directory, the session
+/// files inside it, its local config, its project directory. `history.jsonl`
+/// and `~/.claude.json` belong to no unit: they are rewritten once for the
+/// whole run, which is what `subs` covering every unit at once buys.
+struct Migration<'a> {
+    fs: &'a dyn Fs,
+    claude_home: &'a Path,
+    units: Vec<Unit>,
+    /// Applied to every file this run rewrites, in one pass each.
+    subs: Substitutions,
+    /// The two files every project shares. Both derive from `claude_home`, so
+    /// every unit's scan yields the same pair.
+    history_jsonl: Option<PathBuf>,
+    claude_json: Option<PathBuf>,
+    dry_run: bool,
+    no_backup: bool,
+    session_only: bool,
 }
 
 impl<'a> Migration<'a> {
     fn new(
         fs: &'a dyn Fs,
-        source: &'a Path,
-        target: &'a Path,
+        moves: &[(PathBuf, PathBuf)],
         claude_home: &'a Path,
         opts: &MigrateOpts,
     ) -> Result<Self> {
-        // Validate: both paths must be absolute
-        if !source.is_absolute() {
-            bail!("source path must be absolute, got: {}", source.display());
-        }
-        if !target.is_absolute() {
-            bail!("target path must be absolute, got: {}", target.display());
-        }
+        let units = moves
+            .iter()
+            .map(|(source, target)| Unit::scan(fs, source, target, claude_home, opts))
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_units(fs, units, claude_home, opts)
+    }
 
-        let old_str = source.to_string_lossy().to_string();
-        let new_str = target.to_string_lossy().to_string();
+    fn from_units(
+        fs: &'a dyn Fs,
+        units: Vec<Unit>,
+        claude_home: &'a Path,
+        opts: &MigrateOpts,
+    ) -> Result<Self> {
+        let first = units.first().context("nothing to migrate")?;
 
-        // Scan source state
-        let source_state = scanner::scan(fs, source, claude_home)?;
-
-        // Validate: source must exist as directory OR have global Claude data.
-        // If neither exists, check if the migration was already completed
-        // (target has the project) — support idempotent re-runs.
-        if !source_state.has_claude_data() {
-            // Session-only mode: the idempotency fallback (reuse target state
-            // as source state) is unsafe here. With nothing to move on the
-            // source side, falling through would silently no-op AND, if backup
-            // is enabled, archive target's local `.claude/` — including any
-            // broken symlinks that live there. Bail clearly instead.
-            if source == target || opts.session_only {
-                bail!(
-                    "source not found: {} does not exist and has no Claude Code project data",
-                    source.display()
-                );
-            }
-            let target_state = scanner::scan(fs, target, claude_home)?;
-            if target_state.has_claude_data() {
-                // Migration already completed — use target state to check
-                // if any remaining work is needed (e.g. .claude.json keys)
-                return Ok(Self {
-                    fs,
-                    source,
-                    target,
-                    source_state: target_state,
-                    claude_home,
-                    dry_run: opts.dry_run,
-                    no_backup: opts.no_backup,
-                    session_only: opts.session_only,
-                    subs: Substitutions::one(&old_str, &new_str),
-                    subprojects: Vec::new(),
-                    old_str,
-                    new_str,
-                });
-            }
-            bail!(
-                "source not found: {} does not exist and has no Claude Code project data",
-                source.display()
-            );
-        }
-
-        // Conflict check — skipped in session-only mode (target global may
-        // already exist; rename_global_dir will merge into it).
-        if source != target && !opts.session_only {
-            let target_state = scanner::scan(fs, target, claude_home)?;
-            if target_state.global_project_dir.is_some() && !opts.force {
-                bail!(
-                    "conflict: target {} already has Claude Code project data; use --force to overwrite",
-                    target.display()
-                );
-            }
-        }
+        // A move onto itself contributes no substitution: applying one would
+        // rewrite every matching file to its own contents.
+        let subs = Substitutions::new(
+            units
+                .iter()
+                .filter(|unit| unit.source != unit.target)
+                .map(|unit| {
+                    (
+                        unit.source.to_string_lossy().into_owned(),
+                        unit.target.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        );
 
         Ok(Self {
             fs,
-            source,
-            target,
-            source_state,
             claude_home,
+            history_jsonl: first.state.history_jsonl.clone(),
+            claude_json: first.state.claude_json.clone(),
+            units,
+            subs,
             dry_run: opts.dry_run,
             no_backup: opts.no_backup,
             session_only: opts.session_only,
-            subs: Substitutions::one(&old_str, &new_str),
-            subprojects: Vec::new(),
-            old_str,
-            new_str,
         })
+    }
+
+    /// The units that still have work left.
+    fn active(&self) -> impl Iterator<Item = &Unit> {
+        self.units.iter().filter(|unit| !unit.nothing_to_do)
     }
 
     fn run(mut self) -> Result<MigrationReport> {
         if self.session_only {
             return self.run_session_only();
         }
-        // Idempotency check
-        if self.source_state.paths_consistent
-            && self.source_state.project_dir_exists
-            && self.source == self.target
-        {
-            return Ok(MigrationReport {
-                action: "move".to_owned(),
-                source: Some(self.source.to_path_buf()),
-                target: Some(self.target.to_path_buf()),
-                global_dir_rename: None,
-                files_updated: Vec::new(),
-                backup_path: None,
-                dry_run: self.dry_run,
-                nothing_to_do: true,
-            });
+        for unit in &mut self.units {
+            unit.nothing_to_do = unit.state.paths_consistent
+                && unit.state.project_dir_exists
+                && unit.source == unit.target;
+        }
+        if self.units.iter().all(|unit| unit.nothing_to_do) {
+            return Ok(self.settled_report("move"));
         }
 
         // Discover before anything is rewritten — the keys still name the
         // old paths at this point.
-        self.subprojects = self.discover_subprojects()?;
+        let project_keys = self.project_keys()?;
+        let discovered = self
+            .units
+            .iter()
+            .map(|unit| {
+                if unit.nothing_to_do {
+                    Ok(Vec::new())
+                } else {
+                    self.discover_subprojects(unit, &project_keys)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (unit, subprojects) in self.units.iter_mut().zip(discovered) {
+            unit.subprojects = subprojects;
+        }
         self.preflight()?;
 
-        let backup_path = self.create_backup_if_needed()?;
+        let backup_paths = self.create_backups_if_needed()?;
 
-        let (global_dir_rename, mut all_reports) =
-            self.migrate_project(&self.source_state, self.target)?;
-        all_reports.extend(self.migrate_subprojects()?);
+        // Every unit here touches only its own paths: its global session
+        // directory, its local config, its project directory. Distinct targets
+        // encode to distinct global directory names, and validation rejects
+        // any two moves whose paths nest, so no two units meet.
+        let per_unit: Vec<(Option<GlobalRename>, Vec<UpdateReport>)> = self
+            .units
+            .par_iter()
+            .filter(|unit| !unit.nothing_to_do)
+            .map(|unit| {
+                let (rename, mut reports) = self.migrate_project(&unit.state, &unit.target)?;
+                reports.extend(self.migrate_subprojects(unit)?);
+                self.move_project_dir(unit)?;
+                Ok((rename, reports))
+            })
+            .collect::<Result<_>>()?;
+        let (renames, per_unit_reports): (Vec<_>, Vec<_>) = per_unit.into_iter().unzip();
+        let mut all_reports: Vec<UpdateReport> = per_unit_reports.into_iter().flatten().collect();
 
-        // Shared files, once each: a path-prefix match covers the parent and
-        // every sub-project underneath it in the same pass.
+        // Shared files, once each: a path-prefix match covers every unit and
+        // every sub-project underneath them in the same pass.
         all_reports.extend(self.update_history());
         all_reports.extend(self.update_claude_json());
 
-        self.move_project_dir()?;
-        self.verify()?;
+        for unit in self.active() {
+            self.verify(unit)?;
+        }
 
-        Ok(MigrationReport {
-            action: "move".to_owned(),
-            source: Some(self.source.to_path_buf()),
-            target: Some(self.target.to_path_buf()),
-            global_dir_rename,
-            files_updated: all_reports,
-            backup_path,
-            dry_run: self.dry_run,
-            nothing_to_do: false,
-        })
+        Ok(self.report("move", all_reports, backup_paths, renames))
     }
 
     /// Session-only migration: moves global Claude Code session data
     /// from source to target, leaving both project directories untouched.
-    fn run_session_only(self) -> Result<MigrationReport> {
-        // Pre-check 1: source must have global session data
-        if self.source_state.global_project_dir.is_none() {
-            bail!(
-                "nothing to move: no global session data for {}",
-                self.source.display()
-            );
+    fn run_session_only(mut self) -> Result<MigrationReport> {
+        for unit in &mut self.units {
+            // Pre-check 1: source must have global session data
+            if unit.state.global_project_dir.is_none() {
+                bail!(
+                    "nothing to move: no global session data for {}",
+                    unit.source.display()
+                );
+            }
+            // Pre-check 2: target must exist as directory (otherwise sessions
+            // would be orphaned). Only enforced when source != target.
+            if unit.source != unit.target && !self.fs.is_dir(&unit.target) {
+                bail!(
+                    "target path does not exist; sessions would be orphaned: {}",
+                    unit.target.display()
+                );
+            }
+            unit.nothing_to_do = unit.source == unit.target;
         }
-        // Pre-check 2: target must exist as directory (otherwise sessions would
-        // be orphaned). Only enforced when source != target.
-        if self.source != self.target && !self.fs.is_dir(self.target) {
-            bail!(
-                "target path does not exist; sessions would be orphaned: {}",
-                self.target.display()
-            );
-        }
-        // Noop: source == target
-        if self.source == self.target {
-            return Ok(MigrationReport {
-                action: "session-only-noop".to_owned(),
-                source: Some(self.source.to_path_buf()),
-                target: Some(self.target.to_path_buf()),
-                global_dir_rename: None,
-                files_updated: Vec::new(),
-                backup_path: None,
-                dry_run: self.dry_run,
-                nothing_to_do: true,
-            });
+        if self.units.iter().all(|unit| unit.nothing_to_do) {
+            return Ok(self.settled_report("session-only-noop"));
         }
 
         self.preflight()?;
 
-        let backup_path = self.create_backup_if_needed()?;
-        let global_dir_rename = self.compute_global_rename()?;
-        self.rename_global_dir(global_dir_rename.as_ref())?;
+        let backup_paths = self.create_backups_if_needed()?;
 
+        let mut renames = Vec::new();
         let mut all_reports = Vec::new();
-        all_reports.extend(self.update_session_files(global_dir_rename.as_ref())?);
+        for unit in self.active() {
+            let rename = self.global_rename_for(&unit.state, &unit.target)?;
+            self.rename_global_dir(rename.as_ref())?;
+            all_reports.extend(self.update_session_files_for(&unit.state, rename.as_ref())?);
+            renames.push(rename);
+        }
         all_reports.extend(self.update_history());
         all_reports.extend(self.update_claude_json());
 
@@ -325,20 +446,47 @@ impl<'a> Migration<'a> {
             eprintln!("session-only: skipping full verify; source project dir untouched");
         }
 
-        Ok(MigrationReport {
-            action: "session-only".to_owned(),
-            source: Some(self.source.to_path_buf()),
-            target: Some(self.target.to_path_buf()),
-            global_dir_rename,
-            files_updated: all_reports,
-            backup_path,
-            dry_run: self.dry_run,
-            nothing_to_do: false,
-        })
+        Ok(self.report("session-only", all_reports, backup_paths, renames))
     }
 
-    fn compute_global_rename(&self) -> Result<Option<(PathBuf, PathBuf)>> {
-        self.global_rename_for(&self.source_state, self.target)
+    /// A report over the whole run. `renames` lines up with the units that
+    /// had work, in the order the work ran.
+    fn report(
+        &self,
+        action: &str,
+        files_updated: Vec<UpdateReport>,
+        backup_paths: Vec<PathBuf>,
+        renames: Vec<Option<GlobalRename>>,
+    ) -> MigrationReport {
+        let moves = self
+            .active()
+            .zip(renames)
+            .map(|(unit, global_dir_rename)| MoveReport {
+                source: unit.source.clone(),
+                target: unit.target.clone(),
+                global_dir_rename,
+            })
+            .collect();
+        MigrationReport {
+            action: action.to_owned(),
+            moves,
+            files_updated,
+            backup_paths,
+            dry_run: self.dry_run,
+            nothing_to_do: false,
+        }
+    }
+
+    /// Nothing left to do — every unit is already where it belongs.
+    fn settled_report(&self, action: &str) -> MigrationReport {
+        MigrationReport {
+            action: action.to_owned(),
+            moves: Vec::new(),
+            files_updated: Vec::new(),
+            backup_paths: Vec::new(),
+            dry_run: self.dry_run,
+            nothing_to_do: true,
+        }
     }
 
     /// Where `state`'s global directory has to move for a project landing at
@@ -378,13 +526,6 @@ impl<'a> Migration<'a> {
             }
         }
         Ok(())
-    }
-
-    fn update_session_files(
-        &self,
-        global_dir_rename: Option<&(PathBuf, PathBuf)>,
-    ) -> Result<Vec<UpdateReport>> {
-        self.update_session_files_for(&self.source_state, global_dir_rename)
     }
 
     /// Rewrites the session files and session index belonging to `state`,
@@ -455,7 +596,7 @@ impl<'a> Migration<'a> {
 
     fn update_history(&self) -> Vec<UpdateReport> {
         let mut reports = Vec::new();
-        if let Some(ref history) = self.source_state.history_jsonl
+        if let Some(ref history) = self.history_jsonl
             && let Ok(report) = updater::update_file(self.fs, history, &self.subs, self.dry_run)
         {
             reports.push(report);
@@ -465,7 +606,7 @@ impl<'a> Migration<'a> {
 
     fn update_claude_json(&self) -> Vec<UpdateReport> {
         let mut reports = Vec::new();
-        if let Some(ref cj) = self.source_state.claude_json
+        if let Some(ref cj) = self.claude_json
             && let Ok(report) = updater::rename_json_keys(self.fs, cj, &self.subs, self.dry_run)
         {
             reports.push(report);
@@ -473,11 +614,11 @@ impl<'a> Migration<'a> {
         reports
     }
 
-    /// Projects registered under `source` in `~/.claude.json`, scanned and
-    /// paired with where they land once the parent moves. Scanning here keeps
-    /// the pre-flight and the migration itself on one shared view.
-    fn discover_subprojects(&self) -> Result<Vec<(scanner::ProjectState, PathBuf)>> {
-        let Some(ref cj_path) = self.source_state.claude_json else {
+    /// Every project path `~/.claude.json` knows about. Read once per run:
+    /// the file holds every project on the machine, and a batch would
+    /// otherwise re-read and re-parse it for each of its moves.
+    fn project_keys(&self) -> Result<Vec<String>> {
+        let Some(ref cj_path) = self.claude_json else {
             return Ok(Vec::new());
         };
 
@@ -492,12 +633,25 @@ impl<'a> Migration<'a> {
         else {
             return Ok(Vec::new());
         };
+        Ok(obj.keys().cloned().collect())
+    }
 
-        let prefix = format!("{}/", self.old_str);
-        obj.keys()
+    /// Projects registered under `unit.source`, scanned and paired with where
+    /// they land once the parent moves. Scanning here keeps the pre-flight and
+    /// the migration itself on one shared view.
+    fn discover_subprojects(
+        &self,
+        unit: &Unit,
+        project_keys: &[String],
+    ) -> Result<Vec<(scanner::ProjectState, PathBuf)>> {
+        let old_str = unit.source.to_string_lossy();
+        let new_str = unit.target.to_string_lossy();
+        let prefix = format!("{old_str}/");
+        project_keys
+            .iter()
             .filter(|k| k.starts_with(&prefix))
             .map(|k| {
-                let sub_target = format!("{}{}", self.new_str, &k[self.old_str.len()..]);
+                let sub_target = format!("{new_str}{}", &k[old_str.len()..]);
                 let state = scanner::scan(self.fs, Path::new(k), self.claude_home)?;
                 Ok((state, PathBuf::from(sub_target)))
             })
@@ -517,9 +671,9 @@ impl<'a> Migration<'a> {
     fn preflight(&self) -> Result<()> {
         let mut to_read: Vec<&Path> = Vec::new();
 
-        for state in std::iter::once(&self.source_state)
-            .chain(self.subprojects.iter().map(|(state, _)| state))
-        {
+        for state in self.active().flat_map(|unit| {
+            std::iter::once(&unit.state).chain(unit.subprojects.iter().map(|(state, _)| state))
+        }) {
             to_read.extend(state.session_files.iter().map(PathBuf::as_path));
             to_read.extend(
                 [&state.sessions_index, &state.settings_json, &state.mcp_json]
@@ -529,13 +683,10 @@ impl<'a> Migration<'a> {
             );
         }
         to_read.extend(
-            [
-                &self.source_state.history_jsonl,
-                &self.source_state.claude_json,
-            ]
-            .into_iter()
-            .flatten()
-            .map(PathBuf::as_path),
+            [&self.history_jsonl, &self.claude_json]
+                .into_iter()
+                .flatten()
+                .map(PathBuf::as_path),
         );
 
         let unreadable: Vec<&Path> = to_read
@@ -543,17 +694,32 @@ impl<'a> Migration<'a> {
             .filter(|path| self.fs.read_to_string(path).is_err())
             .collect();
 
-        if unreadable.is_empty() {
+        if !unreadable.is_empty() {
+            let mut list = String::new();
+            for path in &unreadable {
+                let _ = write!(list, "\n  {}", path.display());
+            }
+            bail!(
+                "cannot read {} file(s); nothing was changed:{list}",
+                unreadable.len()
+            );
+        }
+
+        // Session-only leaves the project directories alone, so there is no
+        // rename to vet there.
+        if self.session_only {
             return Ok(());
         }
-        let mut list = String::new();
-        for path in &unreadable {
-            let _ = write!(list, "\n  {}", path.display());
+        for unit in self.active() {
+            if unit.source != unit.target && self.fs.is_dir(&unit.source) {
+                self.fs
+                    .can_rename(&unit.source, &unit.target)
+                    .with_context(|| {
+                        format!("cannot move {}; nothing was changed", unit.source.display())
+                    })?;
+            }
         }
-        bail!(
-            "cannot read {} file(s); nothing was changed:{list}",
-            unreadable.len()
-        );
+        Ok(())
     }
 
     /// Everything a single project owns: its global session directory, the
@@ -577,10 +743,10 @@ impl<'a> Migration<'a> {
     /// the parent's move, and the shared files (`history.jsonl`,
     /// `~/.claude.json`) are rewritten once by the parent — a path prefix
     /// match reaches every descendant there.
-    fn migrate_subprojects(&self) -> Result<Vec<UpdateReport>> {
+    fn migrate_subprojects(&self, unit: &Unit) -> Result<Vec<UpdateReport>> {
         let mut reports = Vec::new();
 
-        for (state, sub_target) in &self.subprojects {
+        for (state, sub_target) in &unit.subprojects {
             let (_, sub_reports) = self.migrate_project(state, sub_target)?;
             reports.extend(sub_reports);
         }
@@ -588,62 +754,72 @@ impl<'a> Migration<'a> {
         Ok(reports)
     }
 
-    fn move_project_dir(&self) -> Result<()> {
-        if !self.dry_run && self.source != self.target && self.fs.is_dir(self.source) {
-            if self.fs.is_dir(self.target) {
+    fn move_project_dir(&self, unit: &Unit) -> Result<()> {
+        let (source, target) = (unit.source.as_path(), unit.target.as_path());
+        if !self.dry_run && source != target && self.fs.is_dir(source) {
+            if self.fs.is_dir(target) {
                 // Target already exists (e.g. user moved manually, or previous run).
                 // Merge source into target, preserving existing files.
-                merge_dirs(self.source, self.target)
+                merge_dirs(source, target)
                     .context("merging project directory into existing target")?;
             } else {
                 self.fs
-                    .rename(self.source, self.target)
+                    .rename(source, target)
                     .context("moving project directory")?;
             }
         }
         Ok(())
     }
 
-    fn verify(&self) -> Result<()> {
+    fn verify(&self, unit: &Unit) -> Result<()> {
         if !self.dry_run {
-            let final_state = scanner::scan(self.fs, self.target, self.claude_home)?;
+            let final_state = scanner::scan(self.fs, &unit.target, self.claude_home)?;
             if !final_state.paths_consistent && final_state.global_project_dir.is_some() {
                 bail!(
                     "verification failed: paths are not consistent after migration to {}",
-                    self.target.display()
+                    unit.target.display()
                 );
             }
         }
         Ok(())
     }
 
-    fn create_backup_if_needed(&self) -> Result<Option<PathBuf>> {
+    /// One archive per moving project. A single archive for the whole run
+    /// would need a manifest format that holds more than one source path, and
+    /// `restore` to match — the per-project shape is what both understand.
+    fn create_backups_if_needed(&self) -> Result<Vec<PathBuf>> {
         if self.dry_run || self.no_backup {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        if let Some(ref global) = self.source_state.global_project_dir {
-            // Session-only mode leaves the source project tree untouched,
-            // so backing up `local/.claude/` and `.mcp.json` is wrong (and
-            // unsafe: local `.claude/` may contain broken symlinks). Only
-            // global/ and `.claude.json` (which IS rewritten) are archived.
-            let (local, mcp) = if self.session_only {
-                (None, None)
-            } else {
-                (
-                    self.source_state.local_claude_dir.as_deref(),
-                    self.source_state.mcp_json.as_deref(),
-                )
-            };
-            return Ok(Some(backup::create_backup(
-                self.source,
-                self.claude_home,
-                global,
-                local,
-                mcp,
-                self.source_state.claude_json.as_deref(),
-            )?));
-        }
-        Ok(None)
+        // In parallel: each archive is a gzip pass over one project's session
+        // directory, and on a long plan that dominates the run.
+        self.units
+            .par_iter()
+            .filter(|unit| !unit.nothing_to_do)
+            .filter_map(|unit| {
+                let global = unit.state.global_project_dir.as_ref()?;
+                // Session-only mode leaves the source project tree untouched,
+                // so backing up `local/.claude/` and `.mcp.json` is wrong (and
+                // unsafe: local `.claude/` may contain broken symlinks). Only
+                // global/ and `.claude.json` (which IS rewritten) are archived.
+                let (local, mcp) = if self.session_only {
+                    (None, None)
+                } else {
+                    (
+                        unit.state.local_claude_dir.as_deref(),
+                        unit.state.mcp_json.as_deref(),
+                    )
+                };
+                Some(backup::create_backup(
+                    &unit.source,
+                    self.claude_home,
+                    global,
+                    local,
+                    mcp,
+                    self.claude_json.as_deref(),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -728,6 +904,25 @@ fn merge_dirs(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Batch input, read from a file or, for `-`, from standard input.
+fn read_batch_input(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        return Ok(input);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Absolute form of a source argument. Falls back to lexical normalization so
+/// that an already-moved source (gone from disk) still resolves on a re-run.
+fn resolve_source(arg: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(arg) {
+        Ok(path) => Ok(path),
+        Err(_) => Ok(normalize_path(&std::path::absolute(arg)?)),
+    }
+}
+
 /// Normalize a path by resolving `.` and `..` components without filesystem access.
 fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -761,14 +956,36 @@ fn execute_backup(fs: &dyn Fs, path: &Path, claude_home: &Path) -> Result<Migrat
 
     Ok(MigrationReport {
         action: "backup".to_owned(),
-        source: None,
-        target: None,
-        global_dir_rename: None,
+        moves: Vec::new(),
         files_updated: Vec::new(),
-        backup_path: Some(backup_path),
+        backup_paths: vec![backup_path],
         dry_run: false,
         nothing_to_do: false,
     })
+}
+
+/// Runs a whole plan as one `Migration`, after validating it as a whole.
+///
+/// Validation rules out the interference the moves could otherwise cause: no
+/// move's target is another move's source, and no source nests inside another.
+/// What it does not give is atomicity — a failure partway through leaves the
+/// earlier work applied, and the report is lost with the error.
+fn execute_batch(
+    fs: &dyn Fs,
+    moves: Vec<batch::Move>,
+    claude_home: &Path,
+    opts: &MigrateOpts,
+) -> Result<MigrationReport> {
+    let plan = batch::BatchPlan { moves };
+    let states = plan.validate(fs, claude_home, opts.force)?;
+
+    let units = plan
+        .moves
+        .iter()
+        .zip(states)
+        .map(|(mv, state)| Unit::from_state(&mv.source, &mv.target, state))
+        .collect::<Result<Vec<_>>>()?;
+    Migration::from_units(fs, units, claude_home, opts)?.run()
 }
 
 fn execute_restore(backup_file: &Path) -> Result<MigrationReport> {
@@ -776,11 +993,9 @@ fn execute_restore(backup_file: &Path) -> Result<MigrationReport> {
 
     Ok(MigrationReport {
         action: "restore".to_owned(),
-        source: None,
-        target: None,
-        global_dir_rename: None,
+        moves: Vec::new(),
         files_updated: Vec::new(),
-        backup_path: Some(backup_file.to_path_buf()),
+        backup_paths: vec![backup_file.to_path_buf()],
         dry_run: false,
         nothing_to_do: false,
     })
@@ -795,7 +1010,6 @@ mod tests {
     fn default_opts() -> MigrateOpts {
         MigrateOpts {
             dry_run: false,
-            verbose: false,
             force: false,
             no_backup: true,
             session_only: false,
@@ -805,7 +1019,6 @@ mod tests {
     fn dry_run_opts() -> MigrateOpts {
         MigrateOpts {
             dry_run: true,
-            verbose: false,
             force: false,
             no_backup: true,
             session_only: false,
@@ -1216,10 +1429,79 @@ mod tests {
         );
     }
 
+    /// Three independent moves in one run: the per-project work happens three
+    /// times, the two files every project shares exactly once.
+    #[test]
+    fn batch_writes_shared_files_once() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        for name in ["a", "b", "c"] {
+            setup_project(&fs, &format!("/home/user/{name}"), "/home/user/.claude");
+        }
+        fs.add_dir(Path::new("/home/user/dest"));
+        fs.add_file(
+            Path::new("/home/user/.claude/history.jsonl"),
+            concat!(
+                r#"{"project":"/home/user/a"}"#,
+                "\n",
+                r#"{"project":"/home/user/b"}"#,
+                "\n",
+                r#"{"project":"/home/user/c"}"#,
+            ),
+        );
+        fs.add_file(
+            Path::new("/home/user/.claude.json"),
+            concat!(
+                r#"{"/home/user/a":{"trust":true},"#,
+                r#""/home/user/b":{"trust":true},"#,
+                r#""/home/user/c":{"trust":true}}"#,
+            ),
+        );
+
+        let moves = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| batch::Move {
+                source: PathBuf::from(format!("/home/user/{name}")),
+                target: PathBuf::from(format!("/home/user/dest/{name}")),
+                line: None,
+            })
+            .collect();
+
+        Command::Batch {
+            moves,
+            opts: default_opts(),
+        }
+        .execute(&fs, claude_home)
+        .unwrap();
+
+        assert_eq!(
+            fs.write_count(Path::new("/home/user/.claude/history.jsonl")),
+            1,
+            "history.jsonl"
+        );
+        assert_eq!(
+            fs.write_count(Path::new("/home/user/.claude.json")),
+            1,
+            ".claude.json"
+        );
+
+        // A single write is only right if it carries all three moves.
+        let history = fs
+            .read_to_string(&claude_home.join("history.jsonl"))
+            .unwrap();
+        let cj = fs
+            .read_to_string(Path::new("/home/user/.claude.json"))
+            .unwrap();
+        for name in ["a", "b", "c"] {
+            let landed = format!("/home/user/dest/{name}");
+            assert!(history.contains(&landed), "{history}");
+            assert!(cj.contains(&landed), "{cj}");
+        }
+    }
+
     fn session_only_opts() -> MigrateOpts {
         MigrateOpts {
             dry_run: false,
-            verbose: false,
             force: false,
             no_backup: true,
             session_only: true,
@@ -1229,7 +1511,6 @@ mod tests {
     fn session_only_dry_opts() -> MigrateOpts {
         MigrateOpts {
             dry_run: true,
-            verbose: false,
             force: false,
             no_backup: true,
             session_only: true,
@@ -1583,7 +1864,7 @@ mod tests {
             opts: session_only_opts(), // no_backup = true
         };
         let report = cmd.execute(&fs, claude_home).unwrap();
-        assert!(report.backup_path.is_none());
+        assert!(report.backup_paths.is_empty());
     }
 
     #[test]
@@ -1624,16 +1905,8 @@ mod tests {
         let source = tmp.path().join("worktree-src");
         std::fs::create_dir_all(&source).unwrap();
 
-        let cli = crate::cli::Cli {
-            command: None,
-            source: Some(source.clone()),
-            target: Some(target_dir.clone()),
-            dry_run: false,
-            verbose: false,
-            force: false,
-            no_backup: false,
-            session_only: true,
-        };
+        let mut cli = cli_with_paths(vec![source.clone(), target_dir.clone()]);
+        cli.session_only = true;
 
         let cmd = Command::from_cli(&cli).unwrap();
         match cmd {
@@ -1660,16 +1933,7 @@ mod tests {
         let source = tmp.path().join("myproj");
         std::fs::create_dir_all(&source).unwrap();
 
-        let cli = crate::cli::Cli {
-            command: None,
-            source: Some(source.clone()),
-            target: Some(target_dir.clone()),
-            dry_run: false,
-            verbose: false,
-            force: false,
-            no_backup: false,
-            session_only: false,
-        };
+        let cli = cli_with_paths(vec![source.clone(), target_dir.clone()]);
 
         let cmd = Command::from_cli(&cli).unwrap();
         match cmd {
@@ -1683,5 +1947,83 @@ mod tests {
             }
             _ => panic!("expected Move"),
         }
+    }
+
+    fn cli_with_paths(paths: Vec<PathBuf>) -> crate::cli::Cli {
+        crate::cli::Cli {
+            command: None,
+            paths,
+            batch: None,
+            dry_run: false,
+            verbose: false,
+            force: false,
+            no_backup: false,
+            session_only: false,
+        }
+    }
+
+    #[test]
+    fn from_cli_moves_every_source_into_the_target_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        for dir in [&dest, &a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let cmd = Command::from_cli(&cli_with_paths(vec![a, b, dest.clone()])).unwrap();
+        let Command::Batch { moves, .. } = cmd else {
+            panic!("expected Batch")
+        };
+        let canon_dest = std::fs::canonicalize(&dest).unwrap();
+        let targets: Vec<_> = moves.iter().map(|m| m.target.clone()).collect();
+        assert_eq!(targets, [canon_dest.join("a"), canon_dest.join("b")]);
+    }
+
+    #[test]
+    fn from_cli_reads_moves_from_a_batch_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let list = tmp.path().join("moves.tsv");
+        std::fs::write(&list, "# header\n\n/a\t/x/a\n/b\t/x/b\n").unwrap();
+
+        let mut cli = cli_with_paths(Vec::new());
+        cli.batch = Some(list);
+
+        let cmd = Command::from_cli(&cli).unwrap();
+        let Command::Batch { moves, .. } = cmd else {
+            panic!("expected Batch")
+        };
+        let seen: Vec<_> = moves
+            .iter()
+            .map(|m| (m.source.clone(), m.target.clone(), m.line))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (PathBuf::from("/a"), PathBuf::from("/x/a"), Some(3)),
+                (PathBuf::from("/b"), PathBuf::from("/x/b"), Some(4)),
+            ]
+        );
+    }
+
+    #[test]
+    fn from_cli_rejects_multi_source_when_target_not_a_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let dest = tmp.path().join("dest.txt");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&dest, "not a directory").unwrap();
+
+        let Err(err) = Command::from_cli(&cli_with_paths(vec![a, b, dest])) else {
+            panic!("expected an error")
+        };
+        assert!(
+            err.to_string().contains("target is not a directory"),
+            "{err}"
+        );
     }
 }

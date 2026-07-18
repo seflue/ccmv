@@ -22,7 +22,7 @@ Updates all path references so Claude Code keeps working after a move or rename:
 - Project trust and tool permissions (`~/.claude.json`)
 - Sub-projects nested inside the moved directory
 
-A backup is created automatically before each operation.
+A backup is created automatically before each operation — one archive per project, so a batch produces one per move.
 
 ## Install
 
@@ -49,6 +49,43 @@ Renaming is just a move to a sibling path:
 ccmv ~/projects/old-name ~/projects/new-name
 ```
 
+### Moving many projects
+
+Several sources and a target directory, again like `mv`:
+
+```bash
+ccmv ~/projects/api ~/projects/web ~/projects/cli ~/work/
+```
+
+For longer lists, read the moves from a tab-separated file — one `SOURCE<TAB>TARGET` per line, `#` comments and blank lines skipped:
+
+```bash
+ccmv --batch moves.tsv
+```
+
+```
+# moves.tsv
+/home/user/projects/api	/home/user/work/backend/api
+/home/user/projects/web	/home/user/work/frontend/web
+```
+
+`-` reads the plan from standard input, which is where globbing pays off:
+
+```bash
+for p in ~/projects/*/; do
+  printf '%s\t%s\n' "${p%/}" "$HOME/work/$(basename "$p")"
+done | ccmv --batch -
+```
+
+Unlike positional arguments, a batch line states its target outright — the source name is not appended.
+
+The whole plan is checked before the first write. Rejected are duplicate sources, two sources mapping to one target, chains (`a → b` together with `b → c`), and any two moves whose paths nest one inside the other. All problems are reported at once, with line numbers, so a 120-line plan does not need 120 runs to fix.
+
+Two limitations worth knowing:
+
+- **Paths containing tabs are not supported.** A line with a stray tab aborts the batch rather than guessing which two fields were meant.
+- **A batch is not a transaction.** Validation and the pre-flight check catch what they can before anything is written, but a failure partway through leaves the earlier moves applied. The backups are what gets you back.
+
 ### Preview changes
 
 ```bash
@@ -56,6 +93,8 @@ ccmv -n myapp ~/work/
 ```
 
 Shows which files would be updated and how many path replacements each contains. Nothing is modified.
+
+For a batch, `-n` prints the plan: one line per move plus the global directory it takes with it. Both the move list and the file list stop after ten entries; `-v` prints them whole.
 
 ### Backup and restore
 
@@ -80,8 +119,9 @@ Use case: point a session started in a git worktree back at the parent repo, the
 
 | Flag | Short | Description |
 |------|-------|-------------|
+| `--batch <FILE>` | | Read `SOURCE<TAB>TARGET` lines from a file; `-` reads stdin |
 | `--dry-run` | `-n` | Preview changes, don't modify anything |
-| `--verbose` | `-v` | Detailed output |
+| `--verbose` | `-v` | Print every move and every updated file, not just the first ten |
 | `--force` | | Overwrite if target already has Claude Code data |
 | `--no-backup` | | Skip automatic backup |
 | `--session-only` | | Migrate only session data, leave project directories untouched |

@@ -8,6 +8,7 @@ use crate::encoder;
 use crate::fs::Fs;
 
 /// Current state of a Claude Code project and its references.
+#[derive(Debug)]
 pub struct ProjectState {
     #[allow(dead_code)]
     pub project_path: PathBuf,
@@ -30,6 +31,23 @@ impl ProjectState {
     pub fn has_claude_data(&self) -> bool {
         self.project_dir_exists || self.global_project_dir.is_some()
     }
+}
+
+/// The single wording for the two preconditions every move has to meet. Both
+/// the per-move check and the batch validator report them, and they drifted
+/// apart once already while they were written out at each site.
+pub fn missing_source_error(path: &Path) -> String {
+    format!(
+        "source not found: {} does not exist and has no Claude Code project data",
+        path.display()
+    )
+}
+
+pub fn occupied_target_error(path: &Path) -> String {
+    format!(
+        "conflict: target {} already has Claude Code project data; use --force to overwrite",
+        path.display()
+    )
 }
 
 /// Scans a project path and returns its current state.

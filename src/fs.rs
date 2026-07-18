@@ -2,13 +2,19 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Abstraction over filesystem operations for testability.
 pub trait Fs: Send + Sync {
     fn read_to_string(&self, path: &Path) -> Result<String>;
     fn write_atomically(&self, path: &Path, content: &str) -> Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+    /// Whether `from` could be renamed to `to` right now.
+    ///
+    /// `rename` fails across filesystems (EXDEV) and into a directory this
+    /// process may not write. Both only surface once the rename runs, which
+    /// in a batch is after earlier moves have already landed.
+    fn can_rename(&self, from: &Path, to: &Path) -> Result<()>;
     fn exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
@@ -47,6 +53,40 @@ impl Fs for RealFs {
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         std::fs::rename(from, to)
             .with_context(|| format!("renaming {} -> {}", from.display(), to.display()))
+    }
+
+    fn can_rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let parent = to
+            .parent()
+            .with_context(|| format!("no parent directory for {}", to.display()))?;
+        if !parent.is_dir() {
+            bail!("target directory does not exist: {}", parent.display());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let from_dev = std::fs::metadata(from)
+                .with_context(|| format!("reading {}", from.display()))?
+                .dev();
+            let to_dev = std::fs::metadata(parent)
+                .with_context(|| format!("reading {}", parent.display()))?
+                .dev();
+            if from_dev != to_dev {
+                bail!(
+                    "cross-filesystem move: {} and {} are on different filesystems",
+                    from.display(),
+                    parent.display()
+                );
+            }
+        }
+
+        // Mode bits alone do not say whether this process may create entries
+        // here (ownership, ACLs, read-only mounts). Probing does. The file is
+        // dropped, and so deleted, at the end of this statement.
+        tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("target directory is not writable: {}", parent.display()))?;
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -217,6 +257,15 @@ impl Fs for MockFs {
         Ok(())
     }
 
+    /// Always fine. Devices and permissions do not exist in memory, and the
+    /// missing-parent branch is out of reach too: `dirs` holds only what a
+    /// test adds, so an unregistered parent says nothing about the tree.
+    /// Unit tests therefore pass this gate vacuously — the check is covered
+    /// against `RealFs` and end-to-end instead.
+    fn can_rename(&self, _from: &Path, _to: &Path) -> Result<()> {
+        Ok(())
+    }
+
     fn exists(&self, path: &Path) -> bool {
         self.files.lock().unwrap().contains_key(path) || self.dirs.lock().unwrap().contains(path)
     }
@@ -374,6 +423,33 @@ mod tests {
         let path = dir.path().join("test.txt");
         fs.write_atomically(&path, "hello world").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn real_can_rename_within_one_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("proj");
+        std::fs::create_dir(&source).unwrap();
+
+        RealFs
+            .can_rename(&source, &dir.path().join("moved"))
+            .unwrap();
+    }
+
+    /// The branch that is portably reachable. The other two — a different
+    /// filesystem and an unwritable directory — need a second mount and a
+    /// non-root user respectively, so neither is asserted here.
+    #[test]
+    fn real_can_rename_rejects_missing_target_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("proj");
+        std::fs::create_dir(&source).unwrap();
+
+        let err = RealFs
+            .can_rename(&source, &dir.path().join("gone/proj"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[test]

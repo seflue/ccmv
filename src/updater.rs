@@ -55,10 +55,6 @@ impl Substitutions {
         }
     }
 
-    pub fn one(old: &str, new: &str) -> Self {
-        Self::new(vec![(old.to_owned(), new.to_owned())])
-    }
-
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

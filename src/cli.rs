@@ -16,10 +16,14 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Source project directory
-    pub source: Option<PathBuf>,
-    /// Target directory or path
-    pub target: Option<PathBuf>,
+    /// Source projects, then the target. With more than two paths the target
+    /// must be an existing directory, like `mv`.
+    pub paths: Vec<PathBuf>,
+
+    /// Read moves from a tab-separated file, one `SOURCE<TAB>TARGET` per line;
+    /// `-` reads standard input
+    #[arg(long, value_name = "FILE", conflicts_with = "paths")]
+    pub batch: Option<PathBuf>,
 
     /// Show what would change without modifying anything
     #[arg(short = 'n', long)]
@@ -43,25 +47,48 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn paths(cli: &Cli) -> Vec<&str> {
+        cli.paths.iter().map(|p| p.to_str().unwrap()).collect()
+    }
+
     #[test]
     fn parse_session_only_flag_sets_field() {
-        let cli = Cli::parse_from(["cc-mv", "--session-only", "/a", "/b"]);
+        let cli = Cli::parse_from(["ccmv", "--session-only", "/a", "/b"]);
         assert!(cli.session_only);
-        assert_eq!(cli.source.as_deref(), Some(std::path::Path::new("/a")));
-        assert_eq!(cli.target.as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(paths(&cli), ["/a", "/b"]);
     }
 
     #[test]
     fn parse_without_session_only_flag_defaults_false() {
-        let cli = Cli::parse_from(["cc-mv", "/a", "/b"]);
+        let cli = Cli::parse_from(["ccmv", "/a", "/b"]);
         assert!(!cli.session_only);
     }
 
     #[test]
     fn parse_session_only_combines_with_dry_run() {
-        let cli = Cli::parse_from(["cc-mv", "-n", "--session-only", "/a", "/b"]);
+        let cli = Cli::parse_from(["ccmv", "-n", "--session-only", "/a", "/b"]);
         assert!(cli.dry_run);
         assert!(cli.session_only);
+    }
+
+    #[test]
+    fn parse_three_paths_last_is_target() {
+        let cli = Cli::parse_from(["ccmv", "/a", "/b", "/dst"]);
+        assert_eq!(paths(&cli), ["/a", "/b", "/dst"]);
+    }
+
+    #[test]
+    fn batch_flag_conflicts_with_positional_paths() {
+        let Err(err) = Cli::try_parse_from(["ccmv", "--batch", "moves.tsv", "/a", "/b"]) else {
+            panic!("expected a conflict")
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn batch_dash_means_stdin() {
+        let cli = Cli::parse_from(["ccmv", "--batch", "-"]);
+        assert_eq!(cli.batch.as_deref(), Some(std::path::Path::new("-")));
     }
 }
 

@@ -1,8 +1,5 @@
 // Batch plans: parse a move list, validate it before anything is written.
 
-// Wired into the CLI in phase 4; until then only the tests below reach it.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
@@ -109,12 +106,19 @@ pub fn parse(input: &str) -> Result<Vec<RawMove>> {
 }
 
 impl BatchPlan {
-    /// Checks the whole plan before the first write.
+    /// Checks the whole plan before the first write and hands back the scanned
+    /// source state of every move, in plan order, so the migration does not
+    /// walk the same directories a second time.
     ///
-    /// Chains, swaps and nesting are rejected rather than topologically
-    /// sorted: ordering them correctly buys little, and getting it wrong
-    /// loses data silently.
-    pub fn validate(&self, fs: &dyn Fs, claude_home: &Path, force: bool) -> Result<()> {
+    /// Chains, swaps and nested sources are rejected rather than
+    /// topologically sorted: ordering them correctly buys little, and getting
+    /// it wrong loses data silently.
+    pub fn validate(
+        &self,
+        fs: &dyn Fs,
+        claude_home: &Path,
+        force: bool,
+    ) -> Result<Vec<scanner::ProjectState>> {
         let mut violations = Vec::new();
         let mut first_source: HashMap<&Path, usize> = HashMap::new();
         let mut first_target: HashMap<&Path, usize> = HashMap::new();
@@ -164,49 +168,55 @@ impl BatchPlan {
             }
         }
 
+        // Nesting between two moves, on either side. A target sitting inside
+        // another move's source or target makes the result depend on which
+        // move ran first — the same hazard as two nested sources, and the
+        // reason the project directories can be moved in any order at all.
         for (index, outer) in self.moves.iter().enumerate() {
             for inner in &self.moves[index + 1..] {
-                if nests(&outer.source, &inner.source) {
+                let crossing = [
+                    (&outer.source, &inner.source),
+                    (&outer.source, &inner.target),
+                    (&outer.target, &inner.source),
+                    (&outer.target, &inner.target),
+                ];
+                if let Some((a, b)) = crossing.into_iter().find(|(a, b)| nests(a, b)) {
                     violations.push(Violation::new(
                         inner.line.or(outer.line),
                         format!(
-                            "{} and {} are both sources (nesting)",
-                            outer.source.display(),
-                            inner.source.display()
+                            "{} and {} belong to different moves, one inside the other (nesting)",
+                            a.display(),
+                            b.display()
                         ),
                     ));
                 }
             }
         }
 
+        let mut source_states = Vec::with_capacity(self.moves.len());
         for mv in &self.moves {
             let source_state = scanner::scan(fs, &mv.source, claude_home)?;
             if !source_state.has_claude_data() {
                 violations.push(Violation::new(
                     mv.line,
-                    format!(
-                        "source not found: {} does not exist and has no Claude Code project data",
-                        mv.source.display()
-                    ),
+                    scanner::missing_source_error(&mv.source),
                 ));
             }
+            source_states.push(source_state);
 
             if !force && mv.source != mv.target {
                 let target_state = scanner::scan(fs, &mv.target, claude_home)?;
                 if target_state.global_project_dir.is_some() {
                     violations.push(Violation::new(
                         mv.line,
-                        format!(
-                            "conflict: target {} already has Claude Code project data; use --force to overwrite",
-                            mv.target.display()
-                        ),
+                        scanner::occupied_target_error(&mv.target),
                     ));
                 }
             }
         }
 
         if violations.is_empty() {
-            return Ok(());
+            return Ok(source_states);
         }
 
         // Argument-derived moves have no line and sort last, keeping their
@@ -261,7 +271,11 @@ mod tests {
         fs.add_dir(&Path::new(HOME).join("projects").join(encoded));
     }
 
-    fn validate(moves: Vec<Move>, fs: &MockFs, force: bool) -> anyhow::Result<()> {
+    fn validate(
+        moves: Vec<Move>,
+        fs: &MockFs,
+        force: bool,
+    ) -> anyhow::Result<Vec<scanner::ProjectState>> {
         BatchPlan { moves }.validate(fs, Path::new(HOME), force)
     }
 
@@ -385,6 +399,65 @@ mod tests {
         assert!(err.contains("nesting"), "{err}");
     }
 
+    /// Neither a chain (no target equals a source) nor two nested sources,
+    /// yet the outcome depends on the order: `/x/rust` is gone by the time
+    /// the second move wants to land inside it.
+    #[test]
+    fn rejects_target_nested_in_another_source() {
+        let fs = MockFs::new();
+        with_project(&fs, "/x/rust");
+        with_project(&fs, "/x/toolchain");
+
+        let err = validate(
+            vec![
+                mv(1, "/x/rust", "/y/rust"),
+                mv(2, "/x/toolchain", "/x/rust/toolchain"),
+            ],
+            &fs,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("nesting"), "{err}");
+    }
+
+    /// Two projects landing one inside the other is order-dependent the same
+    /// way, and it is what lets the project directories move in any order.
+    #[test]
+    fn rejects_target_nested_in_another_target() {
+        let fs = MockFs::new();
+        with_project(&fs, "/x/a");
+        with_project(&fs, "/x/b");
+
+        let err = validate(
+            vec![mv(1, "/x/a", "/y/dest"), mv(2, "/x/b", "/y/dest/sub")],
+            &fs,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("nesting"), "{err}");
+    }
+
+    /// The everyday plan: many projects into one directory. Their targets
+    /// share a parent but never contain one another, so the widened check
+    /// must leave it alone.
+    #[test]
+    fn accepts_many_projects_into_one_directory() {
+        let fs = MockFs::new();
+        let moves = (0..5)
+            .map(|i| {
+                let source = format!("/x/proj{i}");
+                with_project(&fs, &source);
+                mv(i + 1, &source, &format!("/y/dest/proj{i}"))
+            })
+            .collect();
+
+        validate(moves, &fs, false).unwrap();
+    }
+
     #[test]
     fn rejects_missing_source() {
         let fs = MockFs::new();
@@ -431,6 +504,28 @@ mod tests {
             .collect();
 
         validate(moves, &fs, false).unwrap();
+    }
+
+    /// The scanned states are the plan's second output: the migration builds
+    /// its units from them instead of walking every source again.
+    #[test]
+    fn returns_the_scanned_source_states_in_plan_order() {
+        let fs = MockFs::new();
+        let moves = (0..3)
+            .map(|i| {
+                let source = format!("/x/proj{i}");
+                with_project(&fs, &source);
+                mv(i + 1, &source, &format!("/y/proj{i}"))
+            })
+            .collect();
+
+        let states = validate(moves, &fs, false).unwrap();
+
+        let paths: Vec<_> = states.iter().map(|s| s.project_path.clone()).collect();
+        assert_eq!(
+            paths,
+            ["/x/proj0", "/x/proj1", "/x/proj2"].map(PathBuf::from)
+        );
     }
 
     // --- Task 3.3: report everything at once ---------------------------

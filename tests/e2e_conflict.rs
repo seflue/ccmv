@@ -45,6 +45,38 @@ fn e2e_conflict_aborts() {
         .stderr(predicate::str::contains("conflict"));
 }
 
+/// A rename that cannot work has to be caught before the first write. The
+/// same check covers the two failures that need a real filesystem to
+/// reproduce (a second mount, an unwritable directory) and so have no
+/// automated test of their own.
+#[test]
+fn e2e_unusable_target_directory_stops_before_any_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (source, claude_home) = common::setup_claude_project(tmp.path(), "myproject");
+
+    let history = claude_home.join("history.jsonl");
+    let before = std::fs::read_to_string(&history).unwrap();
+
+    let source_path = source.to_string_lossy().to_string();
+    let target_path = tmp.path().join("no/such/dir").to_string_lossy().to_string();
+
+    Command::cargo_bin("ccmv")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .args(["--no-backup", &source_path, &target_path])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot move"))
+        .stderr(predicate::str::contains("target directory does not exist"));
+
+    assert!(source.exists(), "source must still be in place");
+    assert_eq!(
+        std::fs::read_to_string(&history).unwrap(),
+        before,
+        "history.jsonl must not have been touched"
+    );
+}
+
 #[test]
 fn e2e_force_merges_into_existing_target() {
     let tmp = tempfile::tempdir().unwrap();
