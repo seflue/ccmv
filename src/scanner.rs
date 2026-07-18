@@ -171,18 +171,35 @@ fn check_paths_consistent(
     if let Some(first_session) = session_files.first()
         && let Ok(content) = fs.read_to_string(first_session)
     {
-        return content.contains(project_str.as_ref());
+        return mentions_path(&content, project_str.as_ref());
     }
 
     // Try sessions-index.json
     if let Some(index_path) = sessions_index
         && let Ok(content) = fs.read_to_string(index_path)
     {
-        return content.contains(project_str.as_ref());
+        return mentions_path(&content, project_str.as_ref());
     }
 
     // No files to check — consistent
     true
+}
+
+/// Whether `content` names `path` or something under it, as opposed to merely
+/// containing those characters. `/x/proj` sits inside both `/x/proj11` and
+/// `/home/other/x/proj` without either being it.
+///
+/// The paths are JSON string values, so a quote ends one and a slash
+/// continues it into a descendant.
+fn mentions_path(content: &str, path: &str) -> bool {
+    content.match_indices(path).any(|(at, _)| {
+        let opens = at == 0 || content.as_bytes()[at - 1] == b'"';
+        let closes = matches!(
+            content[at + path.len()..].chars().next(),
+            None | Some('/' | '"')
+        );
+        opens && closes
+    })
 }
 
 #[cfg(test)]
@@ -318,5 +335,43 @@ mod tests {
         assert!(state.local_claude_dir.is_none());
         assert!(state.global_project_dir.is_none());
         assert!(state.paths_consistent);
+    }
+
+    #[test]
+    fn mentions_path_accepts_the_path_itself_and_descendants() {
+        assert!(mentions_path(r#"{"cwd":"/x/proj"}"#, "/x/proj"));
+        assert!(mentions_path(r#"{"cwd":"/x/proj/sub/file"}"#, "/x/proj"));
+    }
+
+    #[test]
+    fn mentions_path_rejects_a_prefix_sibling() {
+        assert!(!mentions_path(r#"{"cwd":"/x/proj11"}"#, "/x/proj"));
+        assert!(!mentions_path(r#"{"cwd":"/x/project"}"#, "/x/proj"));
+    }
+
+    #[test]
+    fn mentions_path_rejects_the_same_name_elsewhere() {
+        assert!(!mentions_path(r#"{"cwd":"/home/other/x/proj"}"#, "/x/proj"));
+    }
+
+    /// The point of the boundary: a session file naming only a sibling must
+    /// not pass for a consistent one.
+    #[test]
+    fn prefix_sibling_in_session_file_is_not_consistent() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        let project = Path::new("/home/user/proj");
+
+        fs.add_dir(project);
+        let global_dir = claude_home.join("projects").join("-home-user-proj");
+        fs.add_dir(&global_dir);
+        fs.add_file(
+            &global_dir.join("session.jsonl"),
+            r#"{"cwd":"/home/user/proj11"}"#,
+        );
+
+        let state = scan(&fs, project, claude_home).unwrap();
+
+        assert!(!state.paths_consistent);
     }
 }
