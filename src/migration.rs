@@ -164,6 +164,23 @@ impl Command {
     /// Execute this command, producing a `MigrationReport`.
     pub fn execute(self, fs: &dyn Fs, claude_home: &Path) -> Result<MigrationReport> {
         match self {
+            // Session-only has preconditions of its own, and they belong with
+            // the other plan rules rather than halfway through the run. A lone
+            // move is a one-line plan.
+            Self::Move {
+                source,
+                target,
+                opts,
+            } if opts.session_only => execute_batch(
+                fs,
+                vec![batch::Move {
+                    source,
+                    target,
+                    line: None,
+                }],
+                claude_home,
+                &opts,
+            ),
             Self::Move {
                 source,
                 target,
@@ -336,21 +353,61 @@ impl<'a> Migration<'a> {
         self.units.iter().filter(|unit| !unit.nothing_to_do)
     }
 
+    /// The shape of every run: settle, prepare, do the per-unit work, rewrite
+    /// the shared files, verify, report. Only the per-unit middle differs
+    /// between a full move and a session-only one.
     fn run(mut self) -> Result<MigrationReport> {
-        if self.session_only {
-            return self.run_session_only();
-        }
-        for unit in &mut self.units {
-            unit.nothing_to_do = unit.state.paths_consistent
-                && unit.state.project_dir_exists
-                && unit.source == unit.target;
-        }
+        self.mark_settled();
         if self.units.iter().all(|unit| unit.nothing_to_do) {
-            return Ok(self.settled_report("move"));
+            let action = if self.session_only {
+                "session-only-noop"
+            } else {
+                "move"
+            };
+            return Ok(self.settled_report(action));
         }
 
-        // Discover before anything is rewritten — the keys still name the
-        // old paths at this point.
+        if !self.session_only {
+            self.discover_all_subprojects()?;
+        }
+        self.preflight()?;
+
+        let backup_paths = self.create_backups_if_needed()?;
+
+        let (renames, mut all_reports) = if self.session_only {
+            self.move_sessions()?
+        } else {
+            self.move_projects()?
+        };
+
+        // Shared files, once each: a path-prefix match covers every unit and
+        // every sub-project underneath them in the same pass.
+        all_reports.extend(self.update_history());
+        all_reports.extend(self.update_claude_json());
+
+        self.verify_all()?;
+
+        let action = if self.session_only {
+            "session-only"
+        } else {
+            "move"
+        };
+        Ok(self.report(action, all_reports, backup_paths, renames))
+    }
+
+    /// Flags the units already where they belong. Session-only leaves both
+    /// project directories alone, so there the paths decide on their own.
+    fn mark_settled(&mut self) {
+        let session_only = self.session_only;
+        for unit in &mut self.units {
+            unit.nothing_to_do = unit.source == unit.target
+                && (session_only || (unit.state.paths_consistent && unit.state.project_dir_exists));
+        }
+    }
+
+    /// Discovers before anything is rewritten — the keys still name the old
+    /// paths at this point.
+    fn discover_all_subprojects(&mut self) -> Result<()> {
         let project_keys = self.project_keys()?;
         let discovered = self
             .units
@@ -366,14 +423,14 @@ impl<'a> Migration<'a> {
         for (unit, subprojects) in self.units.iter_mut().zip(discovered) {
             unit.subprojects = subprojects;
         }
-        self.preflight()?;
+        Ok(())
+    }
 
-        let backup_paths = self.create_backups_if_needed()?;
-
-        // Every unit here touches only its own paths: its global session
-        // directory, its local config, its project directory. Distinct targets
-        // encode to distinct global directory names, and validation rejects
-        // any two moves whose paths nest, so no two units meet.
+    /// Every unit here touches only its own paths: its global session
+    /// directory, its local config, its project directory. Distinct targets
+    /// encode to distinct global directory names, and validation rejects any
+    /// two moves whose paths nest, so no two units meet.
+    fn move_projects(&self) -> Result<(Vec<Option<GlobalRename>>, Vec<UpdateReport>)> {
         let per_unit: Vec<(Option<GlobalRename>, Vec<UpdateReport>)> = self
             .units
             .par_iter()
@@ -386,67 +443,36 @@ impl<'a> Migration<'a> {
             })
             .collect::<Result<_>>()?;
         let (renames, per_unit_reports): (Vec<_>, Vec<_>) = per_unit.into_iter().unzip();
-        let mut all_reports: Vec<UpdateReport> = per_unit_reports.into_iter().flatten().collect();
-
-        // Shared files, once each: a path-prefix match covers every unit and
-        // every sub-project underneath them in the same pass.
-        all_reports.extend(self.update_history());
-        all_reports.extend(self.update_claude_json());
-
-        for unit in self.active() {
-            self.verify(unit)?;
-        }
-
-        Ok(self.report("move", all_reports, backup_paths, renames))
+        Ok((renames, per_unit_reports.into_iter().flatten().collect()))
     }
 
-    /// Session-only migration: moves global Claude Code session data
-    /// from source to target, leaving both project directories untouched.
-    fn run_session_only(mut self) -> Result<MigrationReport> {
-        for unit in &mut self.units {
-            // Pre-check 1: source must have global session data
-            if unit.state.global_project_dir.is_none() {
-                bail!(
-                    "nothing to move: no global session data for {}",
-                    unit.source.display()
-                );
-            }
-            // Pre-check 2: target must exist as directory (otherwise sessions
-            // would be orphaned). Only enforced when source != target.
-            if unit.source != unit.target && !self.fs.is_dir(&unit.target) {
-                bail!(
-                    "target path does not exist; sessions would be orphaned: {}",
-                    unit.target.display()
-                );
-            }
-            unit.nothing_to_do = unit.source == unit.target;
-        }
-        if self.units.iter().all(|unit| unit.nothing_to_do) {
-            return Ok(self.settled_report("session-only-noop"));
-        }
-
-        self.preflight()?;
-
-        let backup_paths = self.create_backups_if_needed()?;
-
+    /// Moves the global session data and leaves both project directories
+    /// untouched.
+    fn move_sessions(&self) -> Result<(Vec<Option<GlobalRename>>, Vec<UpdateReport>)> {
         let mut renames = Vec::new();
-        let mut all_reports = Vec::new();
+        let mut reports = Vec::new();
         for unit in self.active() {
             let rename = self.global_rename_for(&unit.state, &unit.target)?;
             self.rename_global_dir(rename.as_ref())?;
-            all_reports.extend(self.update_session_files_for(&unit.state, rename.as_ref())?);
+            reports.extend(self.update_session_files_for(&unit.state, rename.as_ref())?);
             renames.push(rename);
         }
-        all_reports.extend(self.update_history());
-        all_reports.extend(self.update_claude_json());
+        Ok((renames, reports))
+    }
 
-        // verify() is intentionally skipped — source project dir may not exist
-        // and target project dir is untouched by design.
-        if !self.dry_run {
-            eprintln!("session-only: skipping full verify; source project dir untouched");
+    /// Session-only has nothing to verify: the source project directory may
+    /// not exist and the target one is untouched by design.
+    fn verify_all(&self) -> Result<()> {
+        if self.session_only {
+            if !self.dry_run {
+                eprintln!("session-only: skipping full verify; source project dir untouched");
+            }
+            return Ok(());
         }
-
-        Ok(self.report("session-only", all_reports, backup_paths, renames))
+        for unit in self.active() {
+            self.verify(unit)?;
+        }
+        Ok(())
     }
 
     /// A report over the whole run. `renames` lines up with the units that
@@ -977,7 +1003,14 @@ fn execute_batch(
     opts: &MigrateOpts,
 ) -> Result<MigrationReport> {
     let plan = batch::BatchPlan { moves };
-    let states = plan.validate(fs, claude_home, opts.force)?;
+    let states = plan.validate(
+        fs,
+        claude_home,
+        &batch::PlanRules {
+            force: opts.force,
+            session_only: opts.session_only,
+        },
+    )?;
 
     let units = plan
         .moves

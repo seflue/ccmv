@@ -40,6 +40,14 @@ pub struct BatchPlan {
     pub moves: Vec<Move>,
 }
 
+/// What the plan is checked against. Session-only moves the global session
+/// data and leaves both project directories where they are, which changes
+/// what counts as a violation.
+pub struct PlanRules {
+    pub force: bool,
+    pub session_only: bool,
+}
+
 /// A rejected plan, carrying every problem found rather than the first.
 /// With 120 lines, fixing them one error per run is unusable.
 #[derive(Debug)]
@@ -117,9 +125,34 @@ impl BatchPlan {
         &self,
         fs: &dyn Fs,
         claude_home: &Path,
-        force: bool,
+        rules: &PlanRules,
     ) -> Result<Vec<scanner::ProjectState>> {
         let mut violations = Vec::new();
+        self.check_shape(&mut violations);
+        let source_states = self.check_paths(fs, claude_home, rules, &mut violations)?;
+
+        if violations.is_empty() {
+            return Ok(source_states);
+        }
+
+        // Argument-derived moves have no line and sort last, keeping their
+        // relative order.
+        violations.sort_by_key(|v| v.line.unwrap_or(usize::MAX));
+        Err(PlanError {
+            problems: violations
+                .into_iter()
+                .map(|v| match v.line {
+                    Some(n) => format!("line {n}: {}", v.message),
+                    None => v.message,
+                })
+                .collect(),
+        }
+        .into())
+    }
+
+    /// The rules that need no filesystem: a path used twice, a chain, two
+    /// moves nesting one inside the other.
+    fn check_shape(&self, violations: &mut Vec<Violation>) {
         let mut first_source: HashMap<&Path, usize> = HashMap::new();
         let mut first_target: HashMap<&Path, usize> = HashMap::new();
 
@@ -192,7 +225,17 @@ impl BatchPlan {
                 }
             }
         }
+    }
 
+    /// The rules that have to look at the filesystem, plus the source states
+    /// they scan on the way.
+    fn check_paths(
+        &self,
+        fs: &dyn Fs,
+        claude_home: &Path,
+        rules: &PlanRules,
+        violations: &mut Vec<Violation>,
+    ) -> Result<Vec<scanner::ProjectState>> {
         let mut source_states = Vec::with_capacity(self.moves.len());
         for mv in &self.moves {
             let source_state = scanner::scan(fs, &mv.source, claude_home)?;
@@ -202,9 +245,34 @@ impl BatchPlan {
                     scanner::missing_source_error(&mv.source),
                 ));
             }
+            if rules.session_only {
+                // Only the global data moves, so a source without any has
+                // nothing to contribute, and a target directory that does not
+                // exist would be left holding orphaned sessions.
+                if source_state.global_project_dir.is_none() {
+                    violations.push(Violation::new(
+                        mv.line,
+                        format!(
+                            "nothing to move: no global session data for {}",
+                            mv.source.display()
+                        ),
+                    ));
+                }
+                if mv.source != mv.target && !fs.is_dir(&mv.target) {
+                    violations.push(Violation::new(
+                        mv.line,
+                        format!(
+                            "target path does not exist; sessions would be orphaned: {}",
+                            mv.target.display()
+                        ),
+                    ));
+                }
+            }
             source_states.push(source_state);
 
-            if !force && mv.source != mv.target {
+            // Session-only merges into an existing target global on purpose,
+            // so an occupied target is the normal case there.
+            if !rules.force && !rules.session_only && mv.source != mv.target {
                 let target_state = scanner::scan(fs, &mv.target, claude_home)?;
                 if target_state.global_project_dir.is_some() {
                     violations.push(Violation::new(
@@ -215,23 +283,7 @@ impl BatchPlan {
             }
         }
 
-        if violations.is_empty() {
-            return Ok(source_states);
-        }
-
-        // Argument-derived moves have no line and sort last, keeping their
-        // relative order.
-        violations.sort_by_key(|v| v.line.unwrap_or(usize::MAX));
-        Err(PlanError {
-            problems: violations
-                .into_iter()
-                .map(|v| match v.line {
-                    Some(n) => format!("line {n}: {}", v.message),
-                    None => v.message,
-                })
-                .collect(),
-        }
-        .into())
+        Ok(source_states)
     }
 }
 
@@ -276,7 +328,28 @@ mod tests {
         fs: &MockFs,
         force: bool,
     ) -> anyhow::Result<Vec<scanner::ProjectState>> {
-        BatchPlan { moves }.validate(fs, Path::new(HOME), force)
+        BatchPlan { moves }.validate(
+            fs,
+            Path::new(HOME),
+            &PlanRules {
+                force,
+                session_only: false,
+            },
+        )
+    }
+
+    fn validate_session_only(
+        moves: Vec<Move>,
+        fs: &MockFs,
+    ) -> anyhow::Result<Vec<scanner::ProjectState>> {
+        BatchPlan { moves }.validate(
+            fs,
+            Path::new(HOME),
+            &PlanRules {
+                force: false,
+                session_only: true,
+            },
+        )
     }
 
     // --- Task 3.1: parser ---------------------------------------------
@@ -526,6 +599,64 @@ mod tests {
             paths,
             ["/x/proj0", "/x/proj1", "/x/proj2"].map(PathBuf::from)
         );
+    }
+
+    // --- session-only rules -------------------------------------------
+
+    /// Merging into an existing target global is what session-only is for, so
+    /// the rule that guards a full move must not fire here.
+    #[test]
+    fn session_only_accepts_occupied_target() {
+        let fs = MockFs::new();
+        with_project(&fs, "/x/a");
+        with_claude_data(&fs, "/x/a");
+        with_project(&fs, "/y/a");
+        with_claude_data(&fs, "/y/a");
+
+        validate_session_only(vec![mv(1, "/x/a", "/y/a")], &fs).unwrap();
+    }
+
+    #[test]
+    fn session_only_rejects_source_without_global_data() {
+        let fs = MockFs::new();
+        with_project(&fs, "/x/a");
+        with_project(&fs, "/y/a");
+
+        let err = validate_session_only(vec![mv(1, "/x/a", "/y/a")], &fs)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("nothing to move"), "{err}");
+    }
+
+    #[test]
+    fn session_only_rejects_missing_target_directory() {
+        let fs = MockFs::new();
+        with_project(&fs, "/x/a");
+        with_claude_data(&fs, "/x/a");
+
+        let err = validate_session_only(vec![mv(1, "/x/a", "/y/gone")], &fs)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("orphaned"), "{err}");
+    }
+
+    /// The point of routing session-only through the plan: both offending
+    /// lines are named in one run.
+    #[test]
+    fn session_only_reports_all_violations_at_once() {
+        let fs = MockFs::new();
+        with_project(&fs, "/x/a");
+        with_project(&fs, "/x/b");
+        with_claude_data(&fs, "/x/b");
+        with_project(&fs, "/y/a");
+
+        let err = validate_session_only(vec![mv(1, "/x/a", "/y/a"), mv(2, "/x/b", "/y/gone")], &fs)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("2 problems"), "{err}");
     }
 
     // --- Task 3.3: report everything at once ---------------------------
