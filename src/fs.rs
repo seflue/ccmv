@@ -9,12 +9,12 @@ pub trait Fs: Send + Sync {
     fn read_to_string(&self, path: &Path) -> Result<String>;
     fn write_atomically(&self, path: &Path, content: &str) -> Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
-    /// Whether `from` could be renamed to `to` right now.
-    ///
-    /// `rename` fails across filesystems (EXDEV) and into a directory this
-    /// process may not write. Both only surface once the rename runs, which
-    /// in a batch is after earlier moves have already landed.
-    fn can_rename(&self, from: &Path, to: &Path) -> Result<()>;
+    /// Which filesystem `path` sits on. `rename` across two of them fails
+    /// with EXDEV.
+    fn device_id(&self, path: &Path) -> Result<u64>;
+    /// Whether this process may create an entry in `dir`. Mode bits alone do
+    /// not say (ownership, ACLs, read-only mounts), so this probes.
+    fn probe_writable(&self, dir: &Path) -> Result<()>;
     fn exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
@@ -26,6 +26,31 @@ pub trait Fs: Send + Sync {
     fn remove_dir_all(&self, path: &Path) -> Result<()>;
     #[allow(dead_code)]
     fn copy_file(&self, from: &Path, to: &Path) -> Result<()>;
+}
+
+/// Whether `from` could be renamed to `to` right now.
+///
+/// `rename` fails when the target directory is missing, across filesystems
+/// (EXDEV), and into a directory this process may not write. All three only
+/// surface once the rename runs, which in a batch is after earlier moves have
+/// already landed.
+pub fn can_rename(fs: &dyn Fs, from: &Path, to: &Path) -> Result<()> {
+    let parent = to
+        .parent()
+        .with_context(|| format!("no parent directory for {}", to.display()))?;
+    if !fs.is_dir(parent) {
+        bail!("target directory does not exist: {}", parent.display());
+    }
+
+    if fs.device_id(from)? != fs.device_id(parent)? {
+        bail!(
+            "cross-filesystem move: {} and {} are on different filesystems",
+            from.display(),
+            parent.display()
+        );
+    }
+
+    fs.probe_writable(parent)
 }
 
 /// Real filesystem implementation delegating to `std::fs`.
@@ -55,37 +80,25 @@ impl Fs for RealFs {
             .with_context(|| format!("renaming {} -> {}", from.display(), to.display()))
     }
 
-    fn can_rename(&self, from: &Path, to: &Path) -> Result<()> {
-        let parent = to
-            .parent()
-            .with_context(|| format!("no parent directory for {}", to.display()))?;
-        if !parent.is_dir() {
-            bail!("target directory does not exist: {}", parent.display());
-        }
+    #[cfg(unix)]
+    fn device_id(&self, path: &Path) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(std::fs::metadata(path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .dev())
+    }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let from_dev = std::fs::metadata(from)
-                .with_context(|| format!("reading {}", from.display()))?
-                .dev();
-            let to_dev = std::fs::metadata(parent)
-                .with_context(|| format!("reading {}", parent.display()))?
-                .dev();
-            if from_dev != to_dev {
-                bail!(
-                    "cross-filesystem move: {} and {} are on different filesystems",
-                    from.display(),
-                    parent.display()
-                );
-            }
-        }
+    /// Without `st_dev` there is nothing to compare, so every path counts as
+    /// the same filesystem and the EXDEV branch never fires.
+    #[cfg(not(unix))]
+    fn device_id(&self, _path: &Path) -> Result<u64> {
+        Ok(0)
+    }
 
-        // Mode bits alone do not say whether this process may create entries
-        // here (ownership, ACLs, read-only mounts). Probing does. The file is
-        // dropped, and so deleted, at the end of this statement.
-        tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("target directory is not writable: {}", parent.display()))?;
+    fn probe_writable(&self, dir: &Path) -> Result<()> {
+        // The file is dropped, and so deleted, at the end of this statement.
+        tempfile::NamedTempFile::new_in(dir)
+            .with_context(|| format!("target directory is not writable: {}", dir.display()))?;
         Ok(())
     }
 
@@ -159,6 +172,10 @@ pub struct MockFs {
     /// Counts `write_atomically` calls per path so tests can assert that a
     /// shared file is rewritten once rather than once per project.
     writes: Mutex<HashMap<PathBuf, usize>>,
+    /// Mount points and the device they carry, for the EXDEV branch.
+    devices: Mutex<HashMap<PathBuf, u64>>,
+    /// Directories `probe_writable` refuses.
+    readonly: Mutex<HashSet<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -168,7 +185,21 @@ impl MockFs {
             files: Mutex::new(HashMap::new()),
             dirs: Mutex::new(HashSet::new()),
             writes: Mutex::new(HashMap::new()),
+            devices: Mutex::new(HashMap::new()),
+            readonly: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Puts `mount` and everything under it on its own filesystem.
+    pub fn add_mount(&self, mount: &Path, device: u64) {
+        self.devices
+            .lock()
+            .unwrap()
+            .insert(mount.to_path_buf(), device);
+    }
+
+    pub fn add_readonly_dir(&self, dir: &Path) {
+        self.readonly.lock().unwrap().insert(dir.to_path_buf());
     }
 
     pub fn write_count(&self, path: &Path) -> usize {
@@ -182,8 +213,14 @@ impl MockFs {
             .insert(path.to_path_buf(), content.to_owned());
     }
 
+    /// Registers `path` and its ancestors: a directory whose parent does not
+    /// exist is not a state a real filesystem can be in, and `can_rename`
+    /// asks about the parent.
     pub fn add_dir(&self, path: &Path) {
-        self.dirs.lock().unwrap().insert(path.to_path_buf());
+        let mut dirs = self.dirs.lock().unwrap();
+        for ancestor in path.ancestors() {
+            dirs.insert(ancestor.to_path_buf());
+        }
     }
 
     #[allow(dead_code)]
@@ -257,12 +294,23 @@ impl Fs for MockFs {
         Ok(())
     }
 
-    /// Always fine. Devices and permissions do not exist in memory, and the
-    /// missing-parent branch is out of reach too: `dirs` holds only what a
-    /// test adds, so an unregistered parent says nothing about the tree.
-    /// Unit tests therefore pass this gate vacuously — the check is covered
-    /// against `RealFs` and end-to-end instead.
-    fn can_rename(&self, _from: &Path, _to: &Path) -> Result<()> {
+    /// One filesystem unless a test says otherwise, matched by longest
+    /// registered prefix so a whole subtree can be given its own device.
+    fn device_id(&self, path: &Path) -> Result<u64> {
+        Ok(self
+            .devices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(mount, _)| path.starts_with(mount))
+            .max_by_key(|(mount, _)| mount.components().count())
+            .map_or(0, |(_, id)| *id))
+    }
+
+    fn probe_writable(&self, dir: &Path) -> Result<()> {
+        if self.readonly.lock().unwrap().contains(dir) {
+            bail!("target directory is not writable: {}", dir.display());
+        }
         Ok(())
     }
 
@@ -431,25 +479,57 @@ mod tests {
         let source = dir.path().join("proj");
         std::fs::create_dir(&source).unwrap();
 
-        RealFs
-            .can_rename(&source, &dir.path().join("moved"))
-            .unwrap();
+        can_rename(&RealFs, &source, &dir.path().join("moved")).unwrap();
     }
 
-    /// The branch that is portably reachable. The other two — a different
-    /// filesystem and an unwritable directory — need a second mount and a
-    /// non-root user respectively, so neither is asserted here.
+    /// The branch that is portably reachable against the real filesystem. The
+    /// other two are asserted against `MockFs`, which can state a second
+    /// device and an unwritable directory outright.
     #[test]
     fn real_can_rename_rejects_missing_target_directory() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("proj");
         std::fs::create_dir(&source).unwrap();
 
-        let err = RealFs
-            .can_rename(&source, &dir.path().join("gone/proj"))
+        let err = can_rename(&RealFs, &source, &dir.path().join("gone/proj"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn can_rename_rejects_a_different_filesystem() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/x/proj"));
+        fs.add_dir(Path::new("/mnt/other"));
+        fs.add_mount(Path::new("/mnt"), 42);
+
+        let err = can_rename(&fs, Path::new("/x/proj"), Path::new("/mnt/other/proj"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cross-filesystem"), "{err}");
+    }
+
+    #[test]
+    fn can_rename_rejects_an_unwritable_target_directory() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/x/proj"));
+        fs.add_dir(Path::new("/y"));
+        fs.add_readonly_dir(Path::new("/y"));
+
+        let err = can_rename(&fs, Path::new("/x/proj"), Path::new("/y/proj"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not writable"), "{err}");
+    }
+
+    #[test]
+    fn can_rename_accepts_one_filesystem_and_a_writable_target() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/x/proj"));
+        fs.add_dir(Path::new("/y"));
+
+        can_rename(&fs, Path::new("/x/proj"), Path::new("/y/proj")).unwrap();
     }
 
     #[test]

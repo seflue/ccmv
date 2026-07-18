@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use crate::backup;
 use crate::batch;
 use crate::encoder;
-use crate::fs::Fs;
+use crate::fs::{self, Fs};
 use crate::scanner;
 use crate::updater::{self, Substitutions, UpdateReport};
 
@@ -738,11 +738,9 @@ impl<'a> Migration<'a> {
         }
         for unit in self.active() {
             if unit.source != unit.target && self.fs.is_dir(&unit.source) {
-                self.fs
-                    .can_rename(&unit.source, &unit.target)
-                    .with_context(|| {
-                        format!("cannot move {}; nothing was changed", unit.source.display())
-                    })?;
+                fs::can_rename(self.fs, &unit.source, &unit.target).with_context(|| {
+                    format!("cannot move {}; nothing was changed", unit.source.display())
+                })?;
             }
         }
         Ok(())
