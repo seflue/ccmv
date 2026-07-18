@@ -116,6 +116,9 @@ use std::sync::Mutex;
 pub struct MockFs {
     files: Mutex<HashMap<PathBuf, String>>,
     dirs: Mutex<HashSet<PathBuf>>,
+    /// Counts `write_atomically` calls per path so tests can assert that a
+    /// shared file is rewritten once rather than once per project.
+    writes: Mutex<HashMap<PathBuf, usize>>,
 }
 
 #[cfg(test)]
@@ -124,7 +127,12 @@ impl MockFs {
         Self {
             files: Mutex::new(HashMap::new()),
             dirs: Mutex::new(HashSet::new()),
+            writes: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn write_count(&self, path: &Path) -> usize {
+        self.writes.lock().unwrap().get(path).copied().unwrap_or(0)
     }
 
     pub fn add_file(&self, path: &Path, content: &str) {
@@ -160,6 +168,12 @@ impl Fs for MockFs {
             .lock()
             .unwrap()
             .insert(path.to_path_buf(), content.to_owned());
+        *self
+            .writes
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
         Ok(())
     }
 
@@ -275,6 +289,29 @@ impl Fs for MockFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_counts_writes_per_path() {
+        let fs = MockFs::new();
+        let path = Path::new("/history.jsonl");
+        assert_eq!(fs.write_count(path), 0);
+
+        fs.write_atomically(path, "a").unwrap();
+        fs.write_atomically(path, "b").unwrap();
+
+        assert_eq!(fs.write_count(path), 2);
+        assert_eq!(fs.write_count(Path::new("/other")), 0);
+    }
+
+    /// `add_file` seeds fixtures; it must not count as a write, or every
+    /// "written exactly once" assertion would start at 1.
+    #[test]
+    fn mock_add_file_is_not_a_write() {
+        let fs = MockFs::new();
+        let path = Path::new("/seeded");
+        fs.add_file(path, "content");
+        assert_eq!(fs.write_count(path), 0);
+    }
 
     #[test]
     fn mock_read_write_roundtrip() {

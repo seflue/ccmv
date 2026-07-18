@@ -23,6 +23,15 @@ pub struct ProjectState {
     pub paths_consistent: bool,
 }
 
+impl ProjectState {
+    /// Whether this path is a Claude Code project at all. A directory with no
+    /// global entry counts, as does a global entry whose directory is already
+    /// gone — both are states a move has to handle.
+    pub fn has_claude_data(&self) -> bool {
+        self.project_dir_exists || self.global_project_dir.is_some()
+    }
+}
+
 /// Scans a project path and returns its current state.
 /// `claude_home` is the path to `~/.claude` (explicit parameter for testability).
 pub fn scan(fs: &dyn Fs, project_path: &Path, claude_home: &Path) -> Result<ProjectState> {

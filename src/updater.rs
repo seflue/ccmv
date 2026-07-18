@@ -27,44 +27,120 @@ fn is_segment_boundary(rest: &str) -> bool {
     }
 }
 
-/// Replaces occurrences of `old` with `new`, but only where `old` ends on a
-/// path-segment boundary. Returns the replacement count and the new content.
-fn replace_paths(content: &str, old: &str, new: &str) -> (usize, String) {
+/// A set of `old path -> new path` substitutions applied as one unit.
+///
+/// Entries are held longest-`old`-first so that nested paths resolve to the
+/// most specific entry: with both `/x` and `/x/sub` in the set, `/x/sub`
+/// must not be consumed by `/x`.
+pub struct Substitutions {
+    /// Sorted by descending `old` length — `match_at` and `match_prefix`
+    /// depend on this to return the longest match first.
+    entries: Vec<(String, String)>,
+    /// Byte values that can begin a match. `replace_paths` probes every
+    /// position in a multi-megabyte file, and paths all start with `/`, so
+    /// this rejects the vast majority of them without scanning `entries`.
+    first_bytes: [bool; 256],
+}
+
+impl Substitutions {
+    pub fn new(mut entries: Vec<(String, String)>) -> Self {
+        entries.sort_by_key(|(old, _)| std::cmp::Reverse(old.len()));
+        let mut first_bytes = [false; 256];
+        for byte in entries.iter().filter_map(|(old, _)| old.as_bytes().first()) {
+            first_bytes[*byte as usize] = true;
+        }
+        Self {
+            entries,
+            first_bytes,
+        }
+    }
+
+    pub fn one(old: &str, new: &str) -> Self {
+        Self::new(vec![(old.to_owned(), new.to_owned())])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Longest entry matching at the start of `rest` on a segment boundary.
+    fn match_at(&self, rest: &str) -> Option<(&str, &str)> {
+        let first = *rest.as_bytes().first()?;
+        if !self.first_bytes[first as usize] {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|(old, _)| {
+                rest.starts_with(old.as_str()) && is_segment_boundary(&rest[old.len()..])
+            })
+            .map(|(old, new)| (old.as_str(), new.as_str()))
+    }
+
+    /// Longest entry whose `old` is `key` itself or a path-prefix of it.
+    ///
+    /// Stricter than `match_at` on purpose: a JSON key is one whole path, so
+    /// only an exact match or a `/`-descendant counts. `match_at` also treats
+    /// a space as a boundary — needed to rewrite hook command strings like
+    /// `cd /old/proj && ...`, but it would wrongly claim the sibling key
+    /// `/old/proj stuff`.
+    fn match_prefix(&self, key: &str) -> Option<(&str, &str)> {
+        self.entries
+            .iter()
+            .find(|(old, _)| {
+                key == old
+                    || (key.len() > old.len()
+                        && key.as_bytes()[old.len()] == b'/'
+                        && key.starts_with(old.as_str()))
+            })
+            .map(|(old, new)| (old.as_str(), new.as_str()))
+    }
+}
+
+/// Applies every substitution in `subs` in a single left-to-right pass,
+/// matching only on path-segment boundaries. Returns the replacement count
+/// and the new content.
+///
+/// The output is never rescanned, so a set containing both `a -> b` and
+/// `b -> c` turns an `a` into a `b` and stops there rather than cascading.
+fn replace_paths(content: &str, subs: &Substitutions) -> (usize, String) {
     let mut out = String::with_capacity(content.len());
     let mut count = 0;
-    let mut rest = content;
+    let mut i = 0;
 
-    while let Some(idx) = rest.find(old) {
-        let after = &rest[idx + old.len()..];
-        out.push_str(&rest[..idx]);
-        if is_segment_boundary(after) {
+    while i < content.len() {
+        let rest = &content[i..];
+        if let Some((old, new)) = subs.match_at(rest) {
             out.push_str(new);
             count += 1;
+            i += old.len();
         } else {
-            out.push_str(old);
+            let c = rest
+                .chars()
+                .next()
+                .expect("loop guard keeps rest non-empty");
+            out.push(c);
+            i += c.len_utf8();
         }
-        rest = after;
     }
-    out.push_str(rest);
 
     (count, out)
 }
 
 /// Updates path references in a single file.
 ///
-/// Reads the file, replaces all occurrences of `old_path` with `new_path`,
-/// and writes back atomically only if changes were made. Matches that merely
+/// Reads the file, applies every substitution in `subs` in one pass, and
+/// writes back atomically only if changes were made. Matches that merely
 /// share a prefix with a sibling path (`/x/proj` vs `/x/proj_other`) are left
 /// alone.
 /// When `dry_run` is `true`, counts replacements without writing.
 pub fn update_file(
     fs: &dyn Fs,
     file: &Path,
-    old_path: &str,
-    new_path: &str,
+    subs: &Substitutions,
     dry_run: bool,
 ) -> Result<UpdateReport> {
-    if !fs.exists(file) {
+    if subs.is_empty() || !fs.exists(file) {
         return Ok(UpdateReport {
             file: file.to_path_buf(),
             replacements: 0,
@@ -73,7 +149,7 @@ pub fn update_file(
     }
 
     let content = fs.read_to_string(file)?;
-    let (count, new_content) = replace_paths(&content, old_path, new_path);
+    let (count, new_content) = replace_paths(&content, subs);
 
     if count == 0 {
         return Ok(UpdateReport {
@@ -99,29 +175,27 @@ pub fn update_file(
 pub fn update_files_parallel(
     fs: &dyn Fs,
     files: &[PathBuf],
-    old_path: &str,
-    new_path: &str,
+    subs: &Substitutions,
     dry_run: bool,
 ) -> Result<Vec<UpdateReport>> {
     files
         .par_iter()
-        .map(|f| update_file(fs, f, old_path, new_path, dry_run))
+        .map(|f| update_file(fs, f, subs, dry_run))
         .collect()
 }
 
-/// Renames the JSON object key `old_prefix` and its path descendants to use
-/// `new_prefix`. Sibling keys sharing only a textual prefix are untouched.
+/// Renames JSON object keys that match a substitution's `old` path or live
+/// underneath it. Sibling keys sharing only a textual prefix are untouched.
 ///
 /// Used for `~/.claude.json` where project paths are top-level keys.
 /// Only keys are modified — values remain untouched.
 pub fn rename_json_keys(
     fs: &dyn Fs,
     path: &Path,
-    old_prefix: &str,
-    new_prefix: &str,
+    subs: &Substitutions,
     dry_run: bool,
 ) -> Result<UpdateReport> {
-    if !fs.exists(path) {
+    if subs.is_empty() || !fs.exists(path) {
         return Ok(UpdateReport {
             file: path.to_path_buf(),
             replacements: 0,
@@ -146,14 +220,13 @@ pub fn rename_json_keys(
         });
     };
 
-    // Segment boundary: `/old` must not match the sibling key `/old_other`.
-    let sub_prefix = format!("{old_prefix}/");
+    // Longest matching prefix wins, so a key under both `/x` and `/x/sub`
+    // follows the more specific entry.
     let renames: Vec<(String, String)> = obj
         .keys()
-        .filter(|k| k.as_str() == old_prefix || k.starts_with(&sub_prefix))
-        .map(|k| {
-            let new_key = format!("{new_prefix}{}", &k[old_prefix.len()..]);
-            (k.clone(), new_key)
+        .filter_map(|k| {
+            let (old, new) = subs.match_prefix(k)?;
+            Some((k.clone(), format!("{new}{}", &k[old.len()..])))
         })
         .collect();
 
@@ -190,6 +263,95 @@ mod tests {
     use crate::fs::MockFs;
     use std::path::Path;
 
+    fn subs(pairs: &[(&str, &str)]) -> Substitutions {
+        Substitutions::new(
+            pairs
+                .iter()
+                .map(|(o, n)| ((*o).to_owned(), (*n).to_owned()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn replace_paths_applies_multiple_substitutions() {
+        let content = r#"{"a":"/x/one","b":"/x/two","c":"/x/three"}"#;
+        let (count, out) = replace_paths(content, &subs(&[("/x/one", "/y/1"), ("/x/two", "/y/2")]));
+
+        assert_eq!(count, 2);
+        assert!(out.contains("/y/1"));
+        assert!(out.contains("/y/2"));
+        assert!(out.contains("/x/three"), "untouched path must survive");
+    }
+
+    /// A single left-to-right pass must not rescan its own output: with
+    /// `a→b` and `b→c` in one set, an `a` becomes `b` and stops there.
+    /// Without this, chained substitutions would silently cascade.
+    #[test]
+    fn replace_paths_does_not_cascade() {
+        let (count, out) = replace_paths(
+            r#"{"p":"/x/a"}"#,
+            &subs(&[("/x/a", "/x/b"), ("/x/b", "/x/c")]),
+        );
+
+        assert_eq!(count, 1);
+        assert!(out.contains("/x/b"));
+        assert!(!out.contains("/x/c"), "output must not be rescanned");
+    }
+
+    /// Nested sources: the longer prefix must win, otherwise `/x` would
+    /// consume `/x/sub` before its own entry is ever considered.
+    #[test]
+    fn replace_paths_longest_match_wins() {
+        let (count, out) = replace_paths(
+            r#"{"p":"/x/sub","q":"/x"}"#,
+            &subs(&[("/x", "/short"), ("/x/sub", "/long")]),
+        );
+
+        assert_eq!(count, 2);
+        assert!(out.contains("/long"));
+        assert!(out.contains("/short"));
+        assert!(!out.contains("/short/sub"));
+    }
+
+    /// `match_at` and `match_prefix` must NOT be merged: text content treats
+    /// a space as a segment boundary (so `cd /old/proj && ...` in a hook
+    /// command gets rewritten), but a JSON key *is* one whole path, so the
+    /// same rule would rewrite the unrelated sibling key `/old proj`.
+    #[test]
+    fn json_keys_are_stricter_about_boundaries_than_text() {
+        let fs = MockFs::new();
+        fs.add_file(
+            Path::new("/home/.claude.json"),
+            r#"{"/x/my":{"trust":true},"/x/my stuff":{"trust":true}}"#,
+        );
+
+        let report = rename_json_keys(
+            &fs,
+            Path::new("/home/.claude.json"),
+            &subs(&[("/x/my", "/y/mine")]),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.replacements, 1, "only the exact key");
+        let content = fs.read_to_string(Path::new("/home/.claude.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("/y/mine").is_some());
+        assert!(
+            parsed.get("/x/my stuff").is_some(),
+            "sibling key with a space must survive"
+        );
+    }
+
+    #[test]
+    fn replace_paths_empty_set_is_noop() {
+        let content = r#"{"p":"/x/a"}"#;
+        let (count, out) = replace_paths(content, &subs(&[]));
+
+        assert_eq!(count, 0);
+        assert_eq!(out, content);
+    }
+
     #[test]
     fn update_replaces_cwd_in_jsonl() {
         let fs = MockFs::new();
@@ -202,8 +364,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/data/session.jsonl"),
-            "/old/path",
-            "/new/path",
+            &subs(&[("/old/path", "/new/path")]),
             false,
         )
         .unwrap();
@@ -224,8 +385,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/data/other.json"),
-            "/old/path",
-            "/new/path",
+            &subs(&[("/old/path", "/new/path")]),
             false,
         )
         .unwrap();
@@ -246,8 +406,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/nonexistent"),
-            "/old/path",
-            "/new/path",
+            &subs(&[("/old/path", "/new/path")]),
             false,
         )
         .unwrap();
@@ -267,8 +426,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/project/.claude/settings.json"),
-            "/home/user/old-project",
-            "/home/user/new-project",
+            &subs(&[("/home/user/old-project", "/home/user/new-project")]),
             false,
         )
         .unwrap();
@@ -294,7 +452,8 @@ mod tests {
             PathBuf::from("/c.jsonl"),
         ];
 
-        let reports = update_files_parallel(&fs, &files, "/old", "/new", false).unwrap();
+        let reports =
+            update_files_parallel(&fs, &files, &subs(&[("/old", "/new")]), false).unwrap();
 
         assert_eq!(reports.len(), 3);
         let updated: Vec<_> = reports.iter().filter(|r| !r.skipped).collect();
@@ -314,8 +473,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/data/sessions-index.json"),
-            "/home/user/old",
-            "/home/user/new",
+            &subs(&[("/home/user/old", "/home/user/new")]),
             false,
         )
         .unwrap();
@@ -338,8 +496,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/data/session.jsonl"),
-            "/old/path",
-            "/new/path",
+            &subs(&[("/old/path", "/new/path")]),
             true, // dry_run
         )
         .unwrap();
@@ -365,8 +522,7 @@ mod tests {
         let report = rename_json_keys(
             &fs,
             Path::new("/home/.claude.json"),
-            "/home/user/old-project",
-            "/home/user/new-project",
+            &subs(&[("/home/user/old-project", "/home/user/new-project")]),
             false,
         )
         .unwrap();
@@ -393,8 +549,7 @@ mod tests {
         let report = rename_json_keys(
             &fs,
             Path::new("/home/.claude.json"),
-            "/home/user/old-project",
-            "/home/user/new-project",
+            &subs(&[("/home/user/old-project", "/home/user/new-project")]),
             false,
         )
         .unwrap();
@@ -423,8 +578,13 @@ mod tests {
             r#"{"/old":{"trust":true},"/old/sub":{"trust":true},"/other":{"trust":true}}"#,
         );
 
-        let report =
-            rename_json_keys(&fs, Path::new("/home/.claude.json"), "/old", "/new", false).unwrap();
+        let report = rename_json_keys(
+            &fs,
+            Path::new("/home/.claude.json"),
+            &subs(&[("/old", "/new")]),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.replacements, 2);
 
@@ -453,8 +613,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/data/history.jsonl"),
-            "/x/hyprland",
-            "/y/hypr",
+            &subs(&[("/x/hyprland", "/y/hypr")]),
             false,
         )
         .unwrap();
@@ -479,8 +638,7 @@ mod tests {
         let report = update_file(
             &fs,
             Path::new("/data/history.jsonl"),
-            "/x/hyprland",
-            "/y/hypr",
+            &subs(&[("/x/hyprland", "/y/hypr")]),
             false,
         )
         .unwrap();
@@ -504,8 +662,7 @@ mod tests {
         let report = rename_json_keys(
             &fs,
             Path::new("/home/.claude.json"),
-            "/x/hyprland",
-            "/y/hypr",
+            &subs(&[("/x/hyprland", "/y/hypr")]),
             false,
         )
         .unwrap();
@@ -528,8 +685,13 @@ mod tests {
         let original = r#"{"/unrelated":{"trust":true}}"#;
         fs.add_file(Path::new("/home/.claude.json"), original);
 
-        let report =
-            rename_json_keys(&fs, Path::new("/home/.claude.json"), "/old", "/new", false).unwrap();
+        let report = rename_json_keys(
+            &fs,
+            Path::new("/home/.claude.json"),
+            &subs(&[("/old", "/new")]),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.replacements, 0);
         assert!(report.skipped);
@@ -541,8 +703,13 @@ mod tests {
         let original = r#"{"/old":{"trust":true}}"#;
         fs.add_file(Path::new("/home/.claude.json"), original);
 
-        let report =
-            rename_json_keys(&fs, Path::new("/home/.claude.json"), "/old", "/new", true).unwrap();
+        let report = rename_json_keys(
+            &fs,
+            Path::new("/home/.claude.json"),
+            &subs(&[("/old", "/new")]),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(report.replacements, 1);
         assert!(!report.skipped);
@@ -562,8 +729,7 @@ mod tests {
         let dry = update_file(
             &fs,
             Path::new("/settings.json"),
-            "/home/user/proj",
-            "/new",
+            &subs(&[("/home/user/proj", "/new")]),
             true,
         )
         .unwrap();
@@ -573,8 +739,7 @@ mod tests {
         let real = update_file(
             &fs,
             Path::new("/settings.json"),
-            "/home/user/proj",
-            "/new",
+            &subs(&[("/home/user/proj", "/new")]),
             false,
         )
         .unwrap();

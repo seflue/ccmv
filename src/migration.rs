@@ -8,7 +8,10 @@ use crate::backup;
 use crate::encoder;
 use crate::fs::Fs;
 use crate::scanner;
-use crate::updater::{self, UpdateReport};
+use crate::updater::{self, Substitutions, UpdateReport};
+
+/// Where a project's global session directory moves, as `(old, new)`.
+type GlobalRename = (PathBuf, PathBuf);
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct MigrateOpts {
@@ -123,6 +126,11 @@ struct Migration<'a> {
     session_only: bool,
     old_str: String,
     new_str: String,
+    /// Applied to every file this migration rewrites, in one pass each.
+    subs: Substitutions,
+    /// Projects nested under `source`, as `(old, new)` pairs. Empty until
+    /// `run` discovers them; session-only moves never populate it.
+    subprojects: Vec<(PathBuf, PathBuf)>,
 }
 
 impl<'a> Migration<'a> {
@@ -150,7 +158,7 @@ impl<'a> Migration<'a> {
         // Validate: source must exist as directory OR have global Claude data.
         // If neither exists, check if the migration was already completed
         // (target has the project) — support idempotent re-runs.
-        if !source_state.project_dir_exists && source_state.global_project_dir.is_none() {
+        if !source_state.has_claude_data() {
             // Session-only mode: the idempotency fallback (reuse target state
             // as source state) is unsafe here. With nothing to move on the
             // source side, falling through would silently no-op AND, if backup
@@ -163,7 +171,7 @@ impl<'a> Migration<'a> {
                 );
             }
             let target_state = scanner::scan(fs, target, claude_home)?;
-            if target_state.project_dir_exists || target_state.global_project_dir.is_some() {
+            if target_state.has_claude_data() {
                 // Migration already completed — use target state to check
                 // if any remaining work is needed (e.g. .claude.json keys)
                 return Ok(Self {
@@ -175,6 +183,8 @@ impl<'a> Migration<'a> {
                     dry_run: opts.dry_run,
                     no_backup: opts.no_backup,
                     session_only: opts.session_only,
+                    subs: Substitutions::one(&old_str, &new_str),
+                    subprojects: Vec::new(),
                     old_str,
                     new_str,
                 });
@@ -206,12 +216,14 @@ impl<'a> Migration<'a> {
             dry_run: opts.dry_run,
             no_backup: opts.no_backup,
             session_only: opts.session_only,
+            subs: Substitutions::one(&old_str, &new_str),
+            subprojects: Vec::new(),
             old_str,
             new_str,
         })
     }
 
-    fn run(self) -> Result<MigrationReport> {
+    fn run(mut self) -> Result<MigrationReport> {
         if self.session_only {
             return self.run_session_only();
         }
@@ -233,18 +245,17 @@ impl<'a> Migration<'a> {
         }
 
         let backup_path = self.create_backup_if_needed()?;
-        let global_dir_rename = self.compute_global_rename()?;
-        self.rename_global_dir(global_dir_rename.as_ref())?;
+        // Discover before anything is rewritten — the keys still name the
+        // old paths at this point.
+        self.subprojects = self.discover_subprojects()?;
 
-        let mut all_reports = Vec::new();
-        all_reports.extend(self.update_session_files(global_dir_rename.as_ref())?);
-        all_reports.extend(self.update_local_config());
-        all_reports.extend(self.update_history());
-
-        // Migrate sub-projects (discovered from ~/.claude.json keys)
+        let (global_dir_rename, mut all_reports) =
+            self.migrate_project(&self.source_state, self.target)?;
         all_reports.extend(self.migrate_subprojects()?);
 
-        // Rename project keys in ~/.claude.json (covers main + sub-projects)
+        // Shared files, once each: a path-prefix match covers the parent and
+        // every sub-project underneath it in the same pass.
+        all_reports.extend(self.update_history());
         all_reports.extend(self.update_claude_json());
 
         self.move_project_dir()?;
@@ -322,16 +333,25 @@ impl<'a> Migration<'a> {
     }
 
     fn compute_global_rename(&self) -> Result<Option<(PathBuf, PathBuf)>> {
-        if let Some(ref old_global) = self.source_state.global_project_dir {
-            let new_encoded = encoder::encode(self.target)?;
-            let new_global = self.claude_home.join("projects").join(&new_encoded);
-            if *old_global == new_global {
-                Ok(None)
-            } else {
-                Ok(Some((old_global.clone(), new_global)))
-            }
-        } else {
+        self.global_rename_for(&self.source_state, self.target)
+    }
+
+    /// Where `state`'s global directory has to move for a project landing at
+    /// `target`. `None` when it is already in the right place.
+    fn global_rename_for(
+        &self,
+        state: &scanner::ProjectState,
+        target: &Path,
+    ) -> Result<Option<(PathBuf, PathBuf)>> {
+        let Some(ref old_global) = state.global_project_dir else {
+            return Ok(None);
+        };
+        let new_encoded = encoder::encode(target)?;
+        let new_global = self.claude_home.join("projects").join(&new_encoded);
+        if *old_global == new_global {
             Ok(None)
+        } else {
+            Ok(Some((old_global.clone(), new_global)))
         }
     }
 
@@ -359,7 +379,17 @@ impl<'a> Migration<'a> {
         &self,
         global_dir_rename: Option<&(PathBuf, PathBuf)>,
     ) -> Result<Vec<UpdateReport>> {
-        let Some(ref old_global) = self.source_state.global_project_dir else {
+        self.update_session_files_for(&self.source_state, global_dir_rename)
+    }
+
+    /// Rewrites the session files and session index belonging to `state`,
+    /// following them into their new global directory when one was renamed.
+    fn update_session_files_for(
+        &self,
+        state: &scanner::ProjectState,
+        global_dir_rename: Option<&(PathBuf, PathBuf)>,
+    ) -> Result<Vec<UpdateReport>> {
+        let Some(ref old_global) = state.global_project_dir else {
             return Ok(Vec::new());
         };
 
@@ -370,9 +400,9 @@ impl<'a> Migration<'a> {
         };
 
         let session_file_paths: Vec<PathBuf> = if self.dry_run {
-            self.source_state.session_files.clone()
+            state.session_files.clone()
         } else {
-            self.source_state
+            state
                 .session_files
                 .iter()
                 .map(|f| {
@@ -384,15 +414,10 @@ impl<'a> Migration<'a> {
                 .collect::<Result<_>>()?
         };
 
-        let mut reports = updater::update_files_parallel(
-            self.fs,
-            &session_file_paths,
-            &self.old_str,
-            &self.new_str,
-            self.dry_run,
-        )?;
+        let mut reports =
+            updater::update_files_parallel(self.fs, &session_file_paths, &self.subs, self.dry_run)?;
 
-        if let Some(ref old_idx) = self.source_state.sessions_index {
+        if let Some(ref old_idx) = state.sessions_index {
             let idx_path = if self.dry_run {
                 old_idx.clone()
             } else {
@@ -401,35 +426,22 @@ impl<'a> Migration<'a> {
                     .context("sessions-index not under expected global dir")?;
                 new_global.join(relative)
             };
-            let report = updater::update_file(
-                self.fs,
-                &idx_path,
-                &self.old_str,
-                &self.new_str,
-                self.dry_run,
-            )?;
+            let report = updater::update_file(self.fs, &idx_path, &self.subs, self.dry_run)?;
             reports.push(report);
         }
 
         Ok(reports)
     }
 
-    fn update_local_config(&self) -> Vec<UpdateReport> {
+    fn update_local_config_for(&self, state: &scanner::ProjectState) -> Vec<UpdateReport> {
         let mut reports = Vec::new();
-        if let Some(ref settings) = self.source_state.settings_json
-            && let Ok(report) = updater::update_file(
-                self.fs,
-                settings,
-                &self.old_str,
-                &self.new_str,
-                self.dry_run,
-            )
+        if let Some(ref settings) = state.settings_json
+            && let Ok(report) = updater::update_file(self.fs, settings, &self.subs, self.dry_run)
         {
             reports.push(report);
         }
-        if let Some(ref mcp) = self.source_state.mcp_json
-            && let Ok(report) =
-                updater::update_file(self.fs, mcp, &self.old_str, &self.new_str, self.dry_run)
+        if let Some(ref mcp) = state.mcp_json
+            && let Ok(report) = updater::update_file(self.fs, mcp, &self.subs, self.dry_run)
         {
             reports.push(report);
         }
@@ -439,8 +451,7 @@ impl<'a> Migration<'a> {
     fn update_history(&self) -> Vec<UpdateReport> {
         let mut reports = Vec::new();
         if let Some(ref history) = self.source_state.history_jsonl
-            && let Ok(report) =
-                updater::update_file(self.fs, history, &self.old_str, &self.new_str, self.dry_run)
+            && let Ok(report) = updater::update_file(self.fs, history, &self.subs, self.dry_run)
         {
             reports.push(report);
         }
@@ -450,56 +461,74 @@ impl<'a> Migration<'a> {
     fn update_claude_json(&self) -> Vec<UpdateReport> {
         let mut reports = Vec::new();
         if let Some(ref cj) = self.source_state.claude_json
-            && let Ok(report) =
-                updater::rename_json_keys(self.fs, cj, &self.old_str, &self.new_str, self.dry_run)
+            && let Ok(report) = updater::rename_json_keys(self.fs, cj, &self.subs, self.dry_run)
         {
             reports.push(report);
         }
         reports
     }
 
-    fn migrate_subprojects(&self) -> Result<Vec<UpdateReport>> {
+    /// Projects registered under `source` in `~/.claude.json`, paired with
+    /// where they land once the parent moves.
+    fn discover_subprojects(&self) -> Result<Vec<(PathBuf, PathBuf)>> {
         let Some(ref cj_path) = self.source_state.claude_json else {
             return Ok(Vec::new());
         };
 
         let content = self.fs.read_to_string(cj_path)?;
         let root: serde_json::Value = serde_json::from_str(&content)?;
-        let Some(obj) = root.as_object() else {
+        // Project keys live under "projects"; older/simpler files put them at
+        // the top level. Same two shapes `rename_json_keys` accepts.
+        let Some(obj) = root
+            .get("projects")
+            .and_then(|v| v.as_object())
+            .or_else(|| root.as_object())
+        else {
             return Ok(Vec::new());
         };
 
         let prefix = format!("{}/", self.old_str);
-        let subprojects: Vec<(PathBuf, PathBuf)> = obj
+        Ok(obj
             .keys()
             .filter(|k| k.starts_with(&prefix))
             .map(|k| {
                 let sub_target = format!("{}{}", self.new_str, &k[self.old_str.len()..]);
                 (PathBuf::from(k), PathBuf::from(sub_target))
             })
-            .collect();
+            .collect())
+    }
 
-        let mut all_reports = Vec::new();
-        let sub_opts = MigrateOpts {
-            dry_run: self.dry_run,
-            verbose: false,
-            force: true,     // sub-project target may already exist
-            no_backup: true, // parent backup covers everything
-            session_only: false,
-        };
+    /// Everything a single project owns: its global session directory, the
+    /// session files inside it, and its local `.claude/settings.json` and
+    /// `.mcp.json`. The parent and every sub-project go through here, so
+    /// "what migrating one project means" is defined in one place.
+    fn migrate_project(
+        &self,
+        state: &scanner::ProjectState,
+        target: &Path,
+    ) -> Result<(Option<GlobalRename>, Vec<UpdateReport>)> {
+        let rename = self.global_rename_for(state, target)?;
+        self.rename_global_dir(rename.as_ref())?;
+        let mut reports = self.update_session_files_for(state, rename.as_ref())?;
+        reports.extend(self.update_local_config_for(state));
+        Ok((rename, reports))
+    }
 
-        for (sub_source, sub_target) in &subprojects {
-            let sub = Migration::new(self.fs, sub_source, sub_target, self.claude_home, &sub_opts);
-            match sub {
-                Ok(migration) => match migration.run() {
-                    Ok(report) => all_reports.extend(report.files_updated),
-                    Err(e) => eprintln!("warning: sub-project {}: {e:#}", sub_source.display()),
-                },
-                Err(e) => eprintln!("warning: sub-project {}: {e:#}", sub_source.display()),
-            }
+    /// A sub-project's global directory is encoded from its own path, so the
+    /// parent's rename does not cover it. Its project directory travels with
+    /// the parent's move, and the shared files (`history.jsonl`,
+    /// `~/.claude.json`) are rewritten once by the parent — a path prefix
+    /// match reaches every descendant there.
+    fn migrate_subprojects(&self) -> Result<Vec<UpdateReport>> {
+        let mut reports = Vec::new();
+
+        for (sub_source, sub_target) in &self.subprojects {
+            let state = scanner::scan(self.fs, sub_source, self.claude_home)?;
+            let (_, sub_reports) = self.migrate_project(&state, sub_target)?;
+            reports.extend(sub_reports);
         }
 
-        Ok(all_reports)
+        Ok(reports)
     }
 
     fn move_project_dir(&self) -> Result<()> {
@@ -922,6 +951,165 @@ mod tests {
             )
             .unwrap();
         assert!(session.contains("/home/user/new-project"));
+    }
+
+    /// Parent with three sub-projects, all present in `~/.claude.json` and
+    /// `history.jsonl`.
+    fn setup_parent_with_subprojects(fs: &MockFs) {
+        let home = "/home/user/.claude";
+        for path in [
+            "/home/user/parent",
+            "/home/user/parent/a",
+            "/home/user/parent/b",
+            "/home/user/parent/c",
+        ] {
+            setup_project(fs, path, home);
+        }
+        // setup_project overwrites these per call; seed the real multi-project
+        // shape once, afterwards.
+        fs.add_file(
+            Path::new("/home/user/.claude/history.jsonl"),
+            concat!(
+                r#"{"project":"/home/user/parent"}"#,
+                "\n",
+                r#"{"project":"/home/user/parent/a"}"#,
+                "\n",
+                r#"{"project":"/home/user/parent/b"}"#,
+                "\n",
+                r#"{"project":"/home/user/parent/c"}"#,
+            ),
+        );
+        fs.add_file(
+            Path::new("/home/user/.claude.json"),
+            concat!(
+                r#"{"/home/user/parent":{"trust":true},"#,
+                r#""/home/user/parent/a":{"trust":true},"#,
+                r#""/home/user/parent/b":{"trust":true},"#,
+                r#""/home/user/parent/c":{"trust":true}}"#,
+            ),
+        );
+    }
+
+    /// The shared global files are rewritten once for the whole tree, not
+    /// once per sub-project.
+    #[test]
+    fn subproject_move_writes_shared_files_once() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_parent_with_subprojects(&fs);
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/parent"),
+            target: PathBuf::from("/home/user/moved"),
+            opts: default_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            fs.write_count(Path::new("/home/user/.claude/history.jsonl")),
+            1,
+            "history.jsonl"
+        );
+        assert_eq!(
+            fs.write_count(Path::new("/home/user/.claude.json")),
+            1,
+            ".claude.json"
+        );
+    }
+
+    /// `.claude/settings.json` and `.mcp.json` are per-project, not shared,
+    /// so the parent's single rewrite does not reach them. Hook commands and
+    /// MCP server paths inside a sub-project would otherwise keep pointing at
+    /// the pre-move directory.
+    #[test]
+    fn subproject_local_config_is_rewritten() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_parent_with_subprojects(&fs);
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/parent"),
+            target: PathBuf::from("/home/user/moved"),
+            opts: default_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let settings = fs
+            .get_file(Path::new("/home/user/moved/a/.claude/settings.json"))
+            .expect("sub-project settings travelled with the parent move");
+        assert!(
+            settings.contains("/home/user/moved/a/.claude/hooks/hook.py"),
+            "{settings}"
+        );
+        assert!(!settings.contains("/home/user/parent"), "{settings}");
+    }
+
+    /// Behaviour the E2E suite pins, asserted here too so the restructure
+    /// cannot pass by simply skipping sub-projects.
+    #[test]
+    fn subproject_globals_and_keys_are_migrated() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_parent_with_subprojects(&fs);
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/parent"),
+            target: PathBuf::from("/home/user/moved"),
+            opts: default_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        for name in ["a", "b", "c"] {
+            let new_sub = format!("/home/user/moved/{name}");
+            let encoded = crate::encoder::encode(Path::new(&new_sub)).unwrap();
+            let global = claude_home.join("projects").join(&encoded);
+            assert!(fs.is_dir(&global), "global dir for {new_sub}");
+
+            let session = fs.read_to_string(&global.join("session.jsonl")).unwrap();
+            assert!(session.contains(&new_sub), "session cwd for {new_sub}");
+        }
+
+        let cj = fs
+            .read_to_string(Path::new("/home/user/.claude.json"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&cj).unwrap();
+        assert!(parsed.get("/home/user/moved").is_some());
+        assert!(parsed.get("/home/user/moved/a").is_some());
+        assert!(parsed.get("/home/user/parent/a").is_none());
+    }
+
+    /// Real `~/.claude.json` nests project keys under `"projects"`. Discovery
+    /// used to look at top-level keys only, so in a real config no
+    /// sub-project was ever found: `rename_json_keys` moved their keys to the
+    /// new paths while their global session directories stayed behind under
+    /// the old encoded name, orphaning the sessions.
+    #[test]
+    fn subprojects_are_found_in_nested_claude_json() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/parent", "/home/user/.claude");
+        setup_project(&fs, "/home/user/parent/a", "/home/user/.claude");
+        fs.add_file(
+            Path::new("/home/user/.claude.json"),
+            concat!(
+                r#"{"numStartups":5,"projects":{"#,
+                r#""/home/user/parent":{"trust":true},"#,
+                r#""/home/user/parent/a":{"trust":true}}}"#,
+            ),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/parent"),
+            target: PathBuf::from("/home/user/moved"),
+            opts: default_opts(),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let encoded = crate::encoder::encode(Path::new("/home/user/moved/a")).unwrap();
+        assert!(
+            fs.is_dir(&claude_home.join("projects").join(&encoded)),
+            "sub-project global dir must follow the key rename"
+        );
     }
 
     fn session_only_opts() -> MigrateOpts {
