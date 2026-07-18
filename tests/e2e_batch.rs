@@ -130,3 +130,81 @@ fn e2e_batch_moves_every_project_and_keeps_references_consistent() {
         assert!(session.contains(&target_str), "session misses {target_str}");
     }
 }
+
+/// Writes a one-line plan; a batch line states its target outright, which is
+/// what the positional form's mv-semantics would get in the way of here.
+fn write_plan(tmp: &Path, source: &Path, target: &Path) -> String {
+    let list = tmp.join("moves.tsv");
+    std::fs::write(
+        &list,
+        format!(
+            "{}\t{}\n",
+            source.to_string_lossy(),
+            target.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    list.to_string_lossy().to_string()
+}
+
+/// A target that is already a project of its own is refused, and `--force`
+/// is what says to overwrite it anyway.
+#[test]
+fn e2e_batch_occupied_target_needs_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (source, _) = common::setup_claude_project(tmp.path(), "src");
+    let (target, _) = common::setup_claude_project(tmp.path(), "dest/taken");
+    let list = write_plan(tmp.path(), &source, &target);
+
+    Command::cargo_bin("ccmv")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .args(["--no-backup", "--batch", &list])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--force"));
+    assert!(source.is_dir(), "nothing may move: {}", source.display());
+
+    Command::cargo_bin("ccmv")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .args(["--no-backup", "--force", "--batch", &list])
+        .assert()
+        .success();
+
+    assert!(!source.exists());
+    assert!(target.join(".claude/settings.json").is_file());
+}
+
+/// `history.jsonl` is shared by every project on the machine. A move rewrites
+/// the lines that name the moved project and must leave the rest alone.
+#[test]
+fn e2e_batch_leaves_other_projects_in_history_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (moved, _) = common::setup_claude_project(tmp.path(), "moved");
+    let (stays, _) = common::setup_claude_project(tmp.path(), "stays");
+    std::fs::create_dir_all(tmp.path().join("dest")).unwrap();
+    let target = tmp.path().join("dest/moved");
+    let list = write_plan(tmp.path(), &moved, &target);
+
+    Command::cargo_bin("ccmv")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .args(["--no-backup", "--batch", &list])
+        .assert()
+        .success();
+
+    let history = std::fs::read_to_string(tmp.path().join(".claude/history.jsonl")).unwrap();
+    assert!(
+        history.contains(&target.to_string_lossy().to_string()),
+        "moved project must be rewritten: {history}"
+    );
+    assert!(
+        !history.contains(&format!("\"{}\"", moved.to_string_lossy())),
+        "old path must be gone: {history}"
+    );
+    assert!(
+        history.contains(&stays.to_string_lossy().to_string()),
+        "the other project must be untouched: {history}"
+    );
+}
