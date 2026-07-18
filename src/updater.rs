@@ -16,10 +16,46 @@ pub struct UpdateReport {
     pub skipped: bool,
 }
 
+/// `true` if `rest` (the text following a path match) starts a new path
+/// segment rather than continuing the matched one.
+///
+/// Without this check, moving `/x/proj` would also rewrite `/x/proj_other`.
+fn is_segment_boundary(rest: &str) -> bool {
+    match rest.chars().next() {
+        None | Some('/') => true,
+        Some(c) => !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')),
+    }
+}
+
+/// Replaces occurrences of `old` with `new`, but only where `old` ends on a
+/// path-segment boundary. Returns the replacement count and the new content.
+fn replace_paths(content: &str, old: &str, new: &str) -> (usize, String) {
+    let mut out = String::with_capacity(content.len());
+    let mut count = 0;
+    let mut rest = content;
+
+    while let Some(idx) = rest.find(old) {
+        let after = &rest[idx + old.len()..];
+        out.push_str(&rest[..idx]);
+        if is_segment_boundary(after) {
+            out.push_str(new);
+            count += 1;
+        } else {
+            out.push_str(old);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+
+    (count, out)
+}
+
 /// Updates path references in a single file.
 ///
 /// Reads the file, replaces all occurrences of `old_path` with `new_path`,
-/// and writes back atomically only if changes were made.
+/// and writes back atomically only if changes were made. Matches that merely
+/// share a prefix with a sibling path (`/x/proj` vs `/x/proj_other`) are left
+/// alone.
 /// When `dry_run` is `true`, counts replacements without writing.
 pub fn update_file(
     fs: &dyn Fs,
@@ -37,7 +73,7 @@ pub fn update_file(
     }
 
     let content = fs.read_to_string(file)?;
-    let count = content.matches(old_path).count();
+    let (count, new_content) = replace_paths(&content, old_path, new_path);
 
     if count == 0 {
         return Ok(UpdateReport {
@@ -48,7 +84,6 @@ pub fn update_file(
     }
 
     if !dry_run {
-        let new_content = content.replace(old_path, new_path);
         fs.write_atomically(file, &new_content)?;
     }
 
@@ -74,7 +109,8 @@ pub fn update_files_parallel(
         .collect()
 }
 
-/// Renames JSON object keys that start with `old_prefix` to use `new_prefix`.
+/// Renames the JSON object key `old_prefix` and its path descendants to use
+/// `new_prefix`. Sibling keys sharing only a textual prefix are untouched.
 ///
 /// Used for `~/.claude.json` where project paths are top-level keys.
 /// Only keys are modified — values remain untouched.
@@ -110,9 +146,11 @@ pub fn rename_json_keys(
         });
     };
 
+    // Segment boundary: `/old` must not match the sibling key `/old_other`.
+    let sub_prefix = format!("{old_prefix}/");
     let renames: Vec<(String, String)> = obj
         .keys()
-        .filter(|k| k.starts_with(old_prefix))
+        .filter(|k| k.as_str() == old_prefix || k.starts_with(&sub_prefix))
         .map(|k| {
             let new_key = format!("{new_prefix}{}", &k[old_prefix.len()..]);
             (k.clone(), new_key)
@@ -397,6 +435,91 @@ mod tests {
         assert!(parsed.get("/other").is_some());
         assert!(parsed.get("/old").is_none());
         assert!(parsed.get("/old/sub").is_none());
+    }
+
+    #[test]
+    fn update_does_not_touch_sibling_paths() {
+        let fs = MockFs::new();
+        fs.add_file(
+            Path::new("/data/history.jsonl"),
+            r#"{"project":"/x/hyprland"}
+{"project":"/x/hyprland_kde-apps"}
+{"project":"/x/hyprland_config_plugin_neovim"}
+{"project":"/x/hyprland-old"}
+{"project":"/x/hyprland.bak"}
+{"project":"/x/hyprland/sub"}"#,
+        );
+
+        let report = update_file(
+            &fs,
+            Path::new("/data/history.jsonl"),
+            "/x/hyprland",
+            "/y/hypr",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.replacements, 2, "only exact path and its descendant");
+
+        let content = fs.read_to_string(Path::new("/data/history.jsonl")).unwrap();
+        assert!(content.contains(r#"{"project":"/y/hypr"}"#));
+        assert!(content.contains(r#"{"project":"/y/hypr/sub"}"#));
+        assert!(content.contains("/x/hyprland_kde-apps"));
+        assert!(content.contains("/x/hyprland_config_plugin_neovim"));
+        assert!(content.contains("/x/hyprland-old"));
+        assert!(content.contains("/x/hyprland.bak"));
+    }
+
+    #[test]
+    fn update_skips_file_with_only_sibling_matches() {
+        let fs = MockFs::new();
+        let original = r#"{"project":"/x/hyprland_kde-apps"}"#;
+        fs.add_file(Path::new("/data/history.jsonl"), original);
+
+        let report = update_file(
+            &fs,
+            Path::new("/data/history.jsonl"),
+            "/x/hyprland",
+            "/y/hypr",
+            false,
+        )
+        .unwrap();
+
+        assert!(report.skipped);
+        assert_eq!(report.replacements, 0);
+        assert_eq!(
+            fs.read_to_string(Path::new("/data/history.jsonl")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn rename_json_keys_ignores_sibling_keys() {
+        let fs = MockFs::new();
+        fs.add_file(
+            Path::new("/home/.claude.json"),
+            r#"{"/x/hyprland":{"trust":true},"/x/hyprland/sub":{"trust":true},"/x/hyprland_kde-apps":{"trust":true},"/x/hyprland-old":{"trust":true}}"#,
+        );
+
+        let report = rename_json_keys(
+            &fs,
+            Path::new("/home/.claude.json"),
+            "/x/hyprland",
+            "/y/hypr",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.replacements, 2);
+
+        let content = fs.read_to_string(Path::new("/home/.claude.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("/y/hypr").is_some());
+        assert!(parsed.get("/y/hypr/sub").is_some());
+        assert!(parsed.get("/x/hyprland").is_none());
+        // Siblings survive under their original keys
+        assert!(parsed.get("/x/hyprland_kde-apps").is_some());
+        assert!(parsed.get("/x/hyprland-old").is_some());
     }
 
     #[test]
