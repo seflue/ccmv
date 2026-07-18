@@ -1,5 +1,6 @@
 // Migration: core orchestration with idempotent migration logic
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -128,9 +129,9 @@ struct Migration<'a> {
     new_str: String,
     /// Applied to every file this migration rewrites, in one pass each.
     subs: Substitutions,
-    /// Projects nested under `source`, as `(old, new)` pairs. Empty until
-    /// `run` discovers them; session-only moves never populate it.
-    subprojects: Vec<(PathBuf, PathBuf)>,
+    /// Projects nested under `source`, as `(scanned state, new path)`. Empty
+    /// until `run` discovers them; session-only moves never populate it.
+    subprojects: Vec<(scanner::ProjectState, PathBuf)>,
 }
 
 impl<'a> Migration<'a> {
@@ -244,10 +245,12 @@ impl<'a> Migration<'a> {
             });
         }
 
-        let backup_path = self.create_backup_if_needed()?;
         // Discover before anything is rewritten — the keys still name the
         // old paths at this point.
         self.subprojects = self.discover_subprojects()?;
+        self.preflight()?;
+
+        let backup_path = self.create_backup_if_needed()?;
 
         let (global_dir_rename, mut all_reports) =
             self.migrate_project(&self.source_state, self.target)?;
@@ -304,6 +307,8 @@ impl<'a> Migration<'a> {
                 nothing_to_do: true,
             });
         }
+
+        self.preflight()?;
 
         let backup_path = self.create_backup_if_needed()?;
         let global_dir_rename = self.compute_global_rename()?;
@@ -468,9 +473,10 @@ impl<'a> Migration<'a> {
         reports
     }
 
-    /// Projects registered under `source` in `~/.claude.json`, paired with
-    /// where they land once the parent moves.
-    fn discover_subprojects(&self) -> Result<Vec<(PathBuf, PathBuf)>> {
+    /// Projects registered under `source` in `~/.claude.json`, scanned and
+    /// paired with where they land once the parent moves. Scanning here keeps
+    /// the pre-flight and the migration itself on one shared view.
+    fn discover_subprojects(&self) -> Result<Vec<(scanner::ProjectState, PathBuf)>> {
         let Some(ref cj_path) = self.source_state.claude_json else {
             return Ok(Vec::new());
         };
@@ -488,14 +494,66 @@ impl<'a> Migration<'a> {
         };
 
         let prefix = format!("{}/", self.old_str);
-        Ok(obj
-            .keys()
+        obj.keys()
             .filter(|k| k.starts_with(&prefix))
             .map(|k| {
                 let sub_target = format!("{}{}", self.new_str, &k[self.old_str.len()..]);
-                (PathBuf::from(k), PathBuf::from(sub_target))
+                let state = scanner::scan(self.fs, Path::new(k), self.claude_home)?;
+                Ok((state, PathBuf::from(sub_target)))
             })
-            .collect())
+            .collect()
+    }
+
+    /// Reads every file this run will rewrite, before the first write.
+    ///
+    /// Failing halfway through leaves some global directories already renamed
+    /// while the project directory and the `~/.claude.json` keys still name
+    /// the old path, so the run has to be stopped while nothing has happened
+    /// yet. Every unreadable file is reported at once — fixing them one run at
+    /// a time is unusable on a tree with many sub-projects.
+    ///
+    /// This is a full read, not an open-and-close: `update_file` needs the
+    /// contents as UTF-8, so anything short of reading them would miss cases.
+    fn preflight(&self) -> Result<()> {
+        let mut to_read: Vec<&Path> = Vec::new();
+
+        for state in std::iter::once(&self.source_state)
+            .chain(self.subprojects.iter().map(|(state, _)| state))
+        {
+            to_read.extend(state.session_files.iter().map(PathBuf::as_path));
+            to_read.extend(
+                [&state.sessions_index, &state.settings_json, &state.mcp_json]
+                    .into_iter()
+                    .flatten()
+                    .map(PathBuf::as_path),
+            );
+        }
+        to_read.extend(
+            [
+                &self.source_state.history_jsonl,
+                &self.source_state.claude_json,
+            ]
+            .into_iter()
+            .flatten()
+            .map(PathBuf::as_path),
+        );
+
+        let unreadable: Vec<&Path> = to_read
+            .into_iter()
+            .filter(|path| self.fs.read_to_string(path).is_err())
+            .collect();
+
+        if unreadable.is_empty() {
+            return Ok(());
+        }
+        let mut list = String::new();
+        for path in &unreadable {
+            let _ = write!(list, "\n  {}", path.display());
+        }
+        bail!(
+            "cannot read {} file(s); nothing was changed:{list}",
+            unreadable.len()
+        );
     }
 
     /// Everything a single project owns: its global session directory, the
@@ -522,9 +580,8 @@ impl<'a> Migration<'a> {
     fn migrate_subprojects(&self) -> Result<Vec<UpdateReport>> {
         let mut reports = Vec::new();
 
-        for (sub_source, sub_target) in &self.subprojects {
-            let state = scanner::scan(self.fs, sub_source, self.claude_home)?;
-            let (_, sub_reports) = self.migrate_project(&state, sub_target)?;
+        for (state, sub_target) in &self.subprojects {
+            let (_, sub_reports) = self.migrate_project(state, sub_target)?;
             reports.extend(sub_reports);
         }
 
@@ -1014,6 +1071,53 @@ mod tests {
             fs.write_count(Path::new("/home/user/.claude.json")),
             1,
             ".claude.json"
+        );
+    }
+
+    /// An unreadable file anywhere in the tree must stop the run before the
+    /// first write. Discovering it mid-flight would leave some global
+    /// directories already renamed while the project directory and the
+    /// `.claude.json` keys still name the old path.
+    #[test]
+    fn unreadable_session_file_stops_the_run_before_any_write() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_parent_with_subprojects(&fs);
+
+        // Listable but not readable — stands in for a broken symlink or a
+        // file the user cannot read.
+        let encoded = crate::encoder::encode(Path::new("/home/user/parent/b")).unwrap();
+        let broken = claude_home
+            .join("projects")
+            .join(&encoded)
+            .join("broken.jsonl");
+        fs.add_dir(&broken);
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/parent"),
+            target: PathBuf::from("/home/user/moved"),
+            opts: default_opts(),
+        };
+        let err = cmd.execute(&fs, claude_home).unwrap_err().to_string();
+
+        assert!(err.contains("broken.jsonl"), "{err}");
+        assert_eq!(
+            fs.write_count(Path::new("/home/user/.claude/history.jsonl")),
+            0,
+            "history.jsonl must not be touched"
+        );
+        assert_eq!(
+            fs.write_count(Path::new("/home/user/.claude.json")),
+            0,
+            ".claude.json must not be touched"
+        );
+        assert!(
+            fs.is_dir(&claude_home.join("projects").join(&encoded)),
+            "no global directory may have been renamed"
+        );
+        assert!(
+            fs.is_dir(Path::new("/home/user/parent")),
+            "the project directory must still be in place"
         );
     }
 
