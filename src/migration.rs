@@ -11,6 +11,7 @@ use crate::backup;
 use crate::batch;
 use crate::encoder;
 use crate::fs::{self, Fs};
+use crate::links;
 use crate::scanner;
 use crate::updater::{self, Substitutions, UpdateReport};
 
@@ -23,6 +24,12 @@ pub struct MigrateOpts {
     pub force: bool,
     pub no_backup: bool,
     pub session_only: bool,
+    /// Opts into the scan `Migration::run` does between `preflight` and
+    /// `create_backups_if_needed` — see CONTEXT.md's *Relink*.
+    pub relink: bool,
+    /// Additional Scan Roots, on top of every project's Local Claude
+    /// Directory.
+    pub scan_root: Vec<PathBuf>,
 }
 
 /// What became of one project. A run reports one of these per move, so a
@@ -34,6 +41,64 @@ pub struct MoveReport {
     pub global_dir_rename: Option<GlobalRename>,
 }
 
+/// A Relink Candidate whose `replace_symlink` call failed. The rename that
+/// made it a candidate already landed, so this is reported, not fatal — see
+/// "Teilfehler brechen den Lauf nicht ab" in the plan.
+#[derive(Debug)]
+pub struct RelinkFailure {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// One row of the Relink Log — see CONTEXT.md's *Relink Log*. `new` is the
+/// raw target string `replace_symlink` was actually given: exactly what is
+/// now on disk at `path`.
+///
+/// `old` is *not* the matching raw string from before the Move — it is
+/// `LinkCandidate::resolved_target`, the link's pre-Move target already
+/// resolved to an absolute path. A relative link's raw old target is
+/// relative to the link's *old* directory; once the link itself has
+/// travelled to a new directory (see the plan's "Kandidaten, die selbst
+/// mitwandern"), writing that raw string back at the *new* `path` — the
+/// README's rollback, `ln -sfn "$old" "$path"` — would resolve against the
+/// wrong depth whenever the Move changes how deep the link's own directory
+/// sits. The resolved, absolute target has no directory to get wrong, so the
+/// rollback is correct unconditionally — at the cost of turning what may
+/// have been a relative link back into an absolute one.
+struct RelinkLogEntry {
+    path: PathBuf,
+    old: PathBuf,
+    new: PathBuf,
+}
+
+/// One Relink Candidate as shown in a `--dry-run` report — see the plan's
+/// "Kandidaten erscheinen unter ihren alten Pfaden": `old` is the candidate's
+/// path exactly as scanned, before any rename, since under `--dry-run`
+/// nothing moved. `new` is where it would be repointed.
+#[derive(Debug)]
+pub struct RelinkCandidateReport {
+    pub old: PathBuf,
+    pub new: PathBuf,
+}
+
+/// Everything `run`'s Relink and Text Reference scan produced, handed to
+/// `report` as one bundle: the Relink Candidates the scan found, and what
+/// happened when `repoint_candidates` acted on them, alongside the Text
+/// Reference side of the same walk.
+struct ScanOutcome {
+    relink_candidates: Vec<links::LinkCandidate>,
+    relink_failures: Vec<RelinkFailure>,
+    /// How many links this run actually repointed, and where the Relink Log
+    /// recording them landed.
+    relinked_count: usize,
+    relink_log_path: Option<PathBuf>,
+    text_reference_count: usize,
+    text_refs_report_path: Option<PathBuf>,
+    /// The Text References this run found, handed to `report` for its
+    /// `--dry-run` listing — see `MigrationReport::text_reference_findings`.
+    text_reference_findings: Vec<links::TextReference>,
+}
+
 #[derive(Debug)]
 pub struct MigrationReport {
     pub action: String,
@@ -42,6 +107,42 @@ pub struct MigrationReport {
     pub backup_paths: Vec<PathBuf>,
     pub dry_run: bool,
     pub nothing_to_do: bool,
+    pub relink_failures: Vec<RelinkFailure>,
+    /// Populated only under `--dry-run`: on a real run these have already
+    /// been written, and only failures are worth reporting.
+    pub relink_candidates: Vec<RelinkCandidateReport>,
+    /// How many links this run repointed. These writes land in *other*
+    /// people's projects, which no backup covers, so a run that stays silent
+    /// about them leaves the user unaware that anything outside the moved
+    /// project changed at all.
+    pub relinked_count: usize,
+    /// Where the Relink Log recording those writes landed. `None` when
+    /// nothing was repointed, or under `--dry-run`, when nothing is written.
+    pub relink_log_path: Option<PathBuf>,
+    /// How many Text References this run found — see CONTEXT.md's *Text
+    /// Reference*. Zero unless `--relink` was given.
+    pub text_reference_count: usize,
+    /// Where the Text Reference report landed. `None` when there was
+    /// nothing to report, or under `--dry-run`, when nothing is written at
+    /// all — see `Migration::write_text_refs_log`.
+    pub text_refs_report_path: Option<PathBuf>,
+    /// Every Text Reference this run found, populated only under
+    /// `--dry-run` — the same rule `relink_candidates` follows for
+    /// symlinks. On a real run these have already been written to
+    /// `text_refs_report_path`, so listing them again here would just
+    /// restate that file.
+    pub text_reference_findings: Vec<links::TextReference>,
+}
+
+impl MigrationReport {
+    /// Non-zero when this run left work undone that the caller should notice
+    /// on the process exit status — currently, an alive Relink Candidate that
+    /// could not be repointed. The Move itself already landed by the time
+    /// this is checked, so a non-zero code reports incomplete cleanup, not a
+    /// failed run.
+    pub fn exit_code(&self) -> i32 {
+        i32::from(!self.relink_failures.is_empty())
+    }
 }
 
 pub enum Command {
@@ -83,6 +184,8 @@ impl Command {
             force: cli.force,
             no_backup: cli.no_backup,
             session_only: cli.session_only,
+            relink: cli.relink,
+            scan_root: cli.scan_root.clone(),
         };
 
         if let Some(ref batch_file) = cli.batch {
@@ -283,6 +386,7 @@ fn require_absolute(source: &Path, target: &Path) -> Result<()> {
 /// files inside it, its local config, its project directory. `history.jsonl`
 /// and `~/.claude.json` belong to no unit: they are rewritten once for the
 /// whole run, which is what `subs` covering every unit at once buys.
+#[allow(clippy::struct_excessive_bools)]
 struct Migration<'a> {
     fs: &'a dyn Fs,
     claude_home: &'a Path,
@@ -296,6 +400,12 @@ struct Migration<'a> {
     dry_run: bool,
     no_backup: bool,
     session_only: bool,
+    /// Whether to scan for and repoint Relink Candidates. `--session-only`
+    /// never sets this — the two are mutually exclusive from `src/cli.rs`.
+    relink: bool,
+    scan_root: Vec<PathBuf>,
+    /// Backing store for `run_timestamp` — see its doc comment.
+    timestamp: std::sync::OnceLock<String>,
 }
 
 impl<'a> Migration<'a> {
@@ -345,6 +455,9 @@ impl<'a> Migration<'a> {
             dry_run: opts.dry_run,
             no_backup: opts.no_backup,
             session_only: opts.session_only,
+            relink: opts.relink,
+            scan_root: opts.scan_root.clone(),
+            timestamp: std::sync::OnceLock::new(),
         })
     }
 
@@ -372,12 +485,62 @@ impl<'a> Migration<'a> {
         }
         self.preflight()?;
 
+        // One scan for the whole run, before any unit renames itself: the
+        // distinction between "already dead" and "broken by this Move" only
+        // holds before the first write. `move_projects` is a `par_iter` —
+        // a scan inside that loop would see the victims of a sibling unit's
+        // rename as already dead and leave them unrepaired forever.
+        let (relink_candidates, text_references) = self.scan_relink_candidates()?;
+
         let backup_paths = self.create_backups_if_needed()?;
 
         let (renames, mut all_reports) = if self.session_only {
             self.move_sessions()?
         } else {
             self.move_projects()?
+        };
+
+        // Only after the renames landed: a candidate written earlier would
+        // bet on the Move succeeding, and a failed Move must relink nothing.
+        let (relink_log_entries, mut relink_failures) = self.repoint_candidates(&relink_candidates);
+        // A failed log write joins the same collected failures as a failed
+        // relink, rather than aborting the run: the renames and the relinks
+        // above are already irreversible, and a hard error here would print
+        // "Error:" and discard the very report of what was repointed — see
+        // "Rückweg: Relink-Log statt Backup-Erweiterung" in the plan.
+        let relinked_count = relink_log_entries.len();
+        let relink_log_path = match self.write_relink_log(&relink_log_entries, &backup_paths) {
+            Ok(path) => path,
+            Err(error) => {
+                relink_failures.push(RelinkFailure {
+                    path: self
+                        .relink_log_path(&backup_paths)
+                        .unwrap_or_else(|_| PathBuf::from("<relink log>")),
+                    error: format!("{error:#}"),
+                });
+                None
+            }
+        };
+
+        // The Text Reference report rewrites nothing either way, so it does
+        // not have to wait on the Move the way a Relink does — but it is
+        // written here regardless, next to the Relink Log, so both land
+        // under the same `{encoded}-{timestamp}` pair instead of each
+        // picking its own fallback timestamp. A write failure joins
+        // `relink_failures` the same way a Relink Log failure does.
+        let text_reference_count = text_references.len();
+        let text_refs_report_path = match self.write_text_refs_log(&text_references, &backup_paths)
+        {
+            Ok(path) => path,
+            Err(error) => {
+                relink_failures.push(RelinkFailure {
+                    path: self
+                        .text_refs_log_path(&backup_paths)
+                        .unwrap_or_else(|_| PathBuf::from("<text references log>")),
+                    error: format!("{error:#}"),
+                });
+                None
+            }
         };
 
         // Shared files, once each: a path-prefix match covers every unit and
@@ -392,7 +555,21 @@ impl<'a> Migration<'a> {
         } else {
             "move"
         };
-        Ok(self.report(action, all_reports, backup_paths, renames))
+        Ok(self.report(
+            action,
+            all_reports,
+            backup_paths,
+            renames,
+            ScanOutcome {
+                relink_candidates,
+                relink_failures,
+                relinked_count,
+                relink_log_path,
+                text_reference_count,
+                text_refs_report_path,
+                text_reference_findings: text_references,
+            },
+        ))
     }
 
     /// Flags the units already where they belong. Session-only leaves both
@@ -424,6 +601,30 @@ impl<'a> Migration<'a> {
             unit.subprojects = subprojects;
         }
         Ok(())
+    }
+
+    /// One walk over this run's Scan Roots feeding two collectors — Relink
+    /// Candidates and Text References, matched against `subs` — see
+    /// CONTEXT.md's *Relink Candidate* and *Text Reference*, and the plan's
+    /// "derselbe Walk, zwei Sammler". A no-op, without touching `fs` at all,
+    /// when `--relink` was not given.
+    fn scan_relink_candidates(
+        &self,
+    ) -> Result<(Vec<links::LinkCandidate>, Vec<links::TextReference>)> {
+        if !self.relink {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let roots = links::scan_roots(self.fs, self.claude_json.as_deref(), &self.scan_root)?;
+        let paths = links::walk_scan_roots(self.fs, &roots);
+        let candidates = paths
+            .par_iter()
+            .filter_map(|path| links::relink_candidate(self.fs, path, &self.subs))
+            .collect();
+        let text_references = paths
+            .par_iter()
+            .flat_map(|path| links::text_references(self.fs, path, &self.subs))
+            .collect();
+        Ok((candidates, text_references))
     }
 
     /// Every unit here touches only its own paths: its global session
@@ -460,6 +661,194 @@ impl<'a> Migration<'a> {
         Ok((renames, reports))
     }
 
+    /// Repoints every alive candidate at its new target, after the Move has
+    /// landed. A candidate's own path is re-based through `subs.match_path`
+    /// first — the same rebasing `update_session_files_for` does for session
+    /// file paths — so a link that travelled with its project is rewritten
+    /// at its new location, not its by-then-nonexistent old one. Dead
+    /// candidates are left alone, and under `--dry-run` nothing is written
+    /// at all, the candidates' old paths standing in for a report of what
+    /// would change.
+    ///
+    /// A single failed `replace_symlink` — a foreign tree that refuses
+    /// writes, say — does not stop the rest: the Move already landed and is
+    /// irreversible at this point, so every other candidate still gets
+    /// repointed. Failures are collected and handed back for the report
+    /// instead.
+    ///
+    /// Returns one `RelinkLogEntry` per successful write, for
+    /// `write_relink_log`, alongside the failures.
+    fn repoint_candidates(
+        &self,
+        candidates: &[links::LinkCandidate],
+    ) -> (Vec<RelinkLogEntry>, Vec<RelinkFailure>) {
+        if self.dry_run {
+            return (Vec::new(), Vec::new());
+        }
+        let results: Vec<Result<RelinkLogEntry, RelinkFailure>> = candidates
+            .par_iter()
+            .filter(|c| c.alive)
+            .map(|candidate| {
+                let write_path = self
+                    .subs
+                    .rebase(&candidate.path)
+                    .unwrap_or_else(|| candidate.path.clone());
+                let raw_target = if candidate.is_relative {
+                    links::relative_target(&write_path, &candidate.new_target)
+                } else {
+                    candidate.new_target.clone()
+                };
+                match self.fs.replace_symlink(&write_path, &raw_target) {
+                    Ok(()) => Ok(RelinkLogEntry {
+                        path: write_path,
+                        old: candidate.resolved_target.clone(),
+                        new: raw_target,
+                    }),
+                    Err(error) => Err(RelinkFailure {
+                        path: write_path,
+                        error: format!("{error:#}"),
+                    }),
+                }
+            })
+            .collect();
+
+        let mut entries = Vec::new();
+        let mut failures = Vec::new();
+        for result in results {
+            match result {
+                Ok(entry) => entries.push(entry),
+                Err(failure) => failures.push(failure),
+            }
+        }
+        (entries, failures)
+    }
+
+    /// Where a run-scoped artefact lands, named the same way as the run's
+    /// backup archive — `{encoded}-{timestamp}.{suffix}` next to
+    /// `{encoded}-{timestamp}.tar.gz` (see `backup::create_backup`) — so the
+    /// two are visibly a pair without a manifest. `--no-backup` leaves no
+    /// archive to share a name with, so the artefact gets its own name
+    /// instead: the first active unit's source, encoded the same way, with
+    /// `run_timestamp` — shared across every artefact this run writes without
+    /// a backup, so a Relink Log and a Text Reference report from the same
+    /// run still carry the same timestamp.
+    fn artifact_log_path(&self, backup_paths: &[PathBuf], suffix: &str) -> Result<PathBuf> {
+        let backup_dir = self.claude_home.join("backups/ccmv");
+        if let Some(backup_path) = backup_paths.first() {
+            let file_name = backup_path.file_name().with_context(|| {
+                format!("backup path has no file name: {}", backup_path.display())
+            })?;
+            let stem = file_name.to_string_lossy();
+            let stem = stem.strip_suffix(".tar.gz").with_context(|| {
+                format!(
+                    "backup path does not end in .tar.gz: {}",
+                    backup_path.display()
+                )
+            })?;
+            return Ok(backup_dir.join(format!("{stem}.{suffix}")));
+        }
+        let source = &self.active().next().context("nothing to migrate")?.source;
+        let encoded = encoder::encode(source)?;
+        Ok(backup_dir.join(format!("{encoded}-{}.{suffix}", self.run_timestamp())))
+    }
+
+    /// Where the Relink Log lands — see CONTEXT.md's *Relink Log* and
+    /// `artifact_log_path`.
+    fn relink_log_path(&self, backup_paths: &[PathBuf]) -> Result<PathBuf> {
+        self.artifact_log_path(backup_paths, "relink.tsv")
+    }
+
+    /// Where the Text Reference report lands — see CONTEXT.md's *Text
+    /// Reference* and `artifact_log_path`. `.textrefs.tsv` in place of
+    /// `.relink.tsv`, sitting next to it and the backup archive so a run's
+    /// three artefacts are visibly a set.
+    fn text_refs_log_path(&self, backup_paths: &[PathBuf]) -> Result<PathBuf> {
+        self.artifact_log_path(backup_paths, "textrefs.tsv")
+    }
+
+    /// The timestamp `artifact_log_path` falls back to when there is no
+    /// backup archive to borrow one from. Computed once and cached: it is
+    /// asked for at least twice per run-without-backup (once per artefact,
+    /// again on a write failure's error path), and two independent
+    /// `chrono::Local::now()` calls could in principle land a second apart,
+    /// breaking the pairing this is meant to preserve.
+    fn run_timestamp(&self) -> &str {
+        self.timestamp
+            .get_or_init(|| chrono::Local::now().format("%Y%m%d-%H%M%S").to_string())
+    }
+
+    /// Writes the Relink Log — see CONTEXT.md's *Relink Log* — one
+    /// `path<TAB>old<TAB>new` row per repointed link. Absent when `entries`
+    /// is empty: an empty log file would read as a failed run, not a quiet
+    /// one.
+    ///
+    /// Sorted by `path`, with the same rationale `text_refs_report` documents
+    /// for its own sort: the Scan Roots feeding `entries` are walked in
+    /// parallel, so nothing else gives these rows a stable order across
+    /// machines and runs.
+    ///
+    /// Returns where the log landed, so the run can say so. A record nobody
+    /// is pointed at does not serve as the account of what ccmv wrote into
+    /// other people's projects.
+    fn write_relink_log(
+        &self,
+        entries: &[RelinkLogEntry],
+        backup_paths: &[PathBuf],
+    ) -> Result<Option<PathBuf>> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let log_path = self.relink_log_path(backup_paths)?;
+        let backup_dir = log_path
+            .parent()
+            .with_context(|| format!("relink log path has no parent: {}", log_path.display()))?;
+        self.fs.create_dir_all(backup_dir)?;
+
+        let mut sorted: Vec<&RelinkLogEntry> = entries.iter().collect();
+        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let mut content = String::new();
+        for entry in sorted {
+            let _ = writeln!(
+                content,
+                "{}\t{}\t{}",
+                entry.path.display(),
+                entry.old.display(),
+                entry.new.display()
+            );
+        }
+        self.fs.write_atomically(&log_path, &content)?;
+        Ok(Some(log_path))
+    }
+
+    /// Writes the Text Reference report — see CONTEXT.md's *Text
+    /// Reference* — and returns the path it landed at. `None` when there is
+    /// nothing to report (the same rule `write_relink_log` follows for an
+    /// empty Relink Log) or under `--dry-run`, when nothing is written at
+    /// all: unlike a Relink, a Text Reference is read-only regardless, but
+    /// the report only means anything alongside the changes a real run just
+    /// made.
+    fn write_text_refs_log(
+        &self,
+        findings: &[links::TextReference],
+        backup_paths: &[PathBuf],
+    ) -> Result<Option<PathBuf>> {
+        if self.dry_run || findings.is_empty() {
+            return Ok(None);
+        }
+        let log_path = self.text_refs_log_path(backup_paths)?;
+        let backup_dir = log_path.parent().with_context(|| {
+            format!(
+                "text references log path has no parent: {}",
+                log_path.display()
+            )
+        })?;
+        self.fs.create_dir_all(backup_dir)?;
+        self.fs
+            .write_atomically(&log_path, &text_refs_report(findings))?;
+        Ok(Some(log_path))
+    }
+
     /// Session-only has nothing to verify: the source project directory may
     /// not exist and the target one is untouched by design.
     fn verify_all(&self) -> Result<()> {
@@ -483,7 +872,17 @@ impl<'a> Migration<'a> {
         files_updated: Vec<UpdateReport>,
         backup_paths: Vec<PathBuf>,
         renames: Vec<Option<GlobalRename>>,
+        scan_outcome: ScanOutcome,
     ) -> MigrationReport {
+        let ScanOutcome {
+            relink_candidates,
+            relink_failures,
+            relinked_count,
+            relink_log_path,
+            text_reference_count,
+            text_refs_report_path,
+            text_reference_findings,
+        } = scan_outcome;
         let moves = self
             .active()
             .zip(renames)
@@ -493,6 +892,30 @@ impl<'a> Migration<'a> {
                 global_dir_rename,
             })
             .collect();
+        // Only meaningful under --dry-run: on a real run repoint_candidates
+        // has already repointed every alive candidate, so listing them again
+        // here would just restate the move. Dead candidates are left alone and
+        // so are not shown as pending changes.
+        let relink_candidates = if self.dry_run {
+            relink_candidates
+                .iter()
+                .filter(|c| c.alive)
+                .map(|c| RelinkCandidateReport {
+                    old: c.path.clone(),
+                    new: c.new_target.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Same rule as `relink_candidates` above: on a real run these have
+        // already been written to `text_refs_report_path`, so they are only
+        // worth handing back to the caller under `--dry-run`.
+        let text_reference_findings = if self.dry_run {
+            text_reference_findings
+        } else {
+            Vec::new()
+        };
         MigrationReport {
             action: action.to_owned(),
             moves,
@@ -500,6 +923,13 @@ impl<'a> Migration<'a> {
             backup_paths,
             dry_run: self.dry_run,
             nothing_to_do: false,
+            relink_failures,
+            relink_candidates,
+            relinked_count,
+            relink_log_path,
+            text_reference_count,
+            text_refs_report_path,
+            text_reference_findings,
         }
     }
 
@@ -512,6 +942,13 @@ impl<'a> Migration<'a> {
             backup_paths: Vec::new(),
             dry_run: self.dry_run,
             nothing_to_do: true,
+            relink_failures: Vec::new(),
+            relink_candidates: Vec::new(),
+            relinked_count: 0,
+            relink_log_path: None,
+            text_reference_count: 0,
+            text_refs_report_path: None,
+            text_reference_findings: Vec::new(),
         }
     }
 
@@ -833,6 +1270,31 @@ impl<'a> Migration<'a> {
     }
 }
 
+/// Renders `findings` as the Text Reference report's TSV body — one
+/// `file<TAB>line<TAB>old<TAB>new` row per Text Reference, see CONTEXT.md's
+/// *Text Reference*. Sorted by `(file, line)`: the scan that produces
+/// `findings` runs its files through a `par_iter`, so nothing else puts a
+/// file's rows next to each other or the files themselves in a stable order
+/// — sorting does both, and as a side effect lets a consumer select one
+/// project's rows with a prefix match on the first column, which always
+/// carries the full absolute path.
+fn text_refs_report(findings: &[links::TextReference]) -> String {
+    let mut sorted: Vec<&links::TextReference> = findings.iter().collect();
+    sorted.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    let mut content = String::new();
+    for finding in sorted {
+        let _ = writeln!(
+            content,
+            "{}\t{}\t{}\t{}",
+            finding.file.display(),
+            finding.line,
+            finding.old,
+            finding.new
+        );
+    }
+    content
+}
+
 /// JSON-merge the `sessions-index.json` files at the top of two global dirs.
 ///
 /// When both source and target global dirs contain a `sessions-index.json`,
@@ -964,6 +1426,13 @@ fn execute_backup(fs: &dyn Fs, path: &Path, claude_home: &Path) -> Result<Migrat
         backup_paths: vec![backup_path],
         dry_run: false,
         nothing_to_do: false,
+        relink_failures: Vec::new(),
+        relink_candidates: Vec::new(),
+        relinked_count: 0,
+        relink_log_path: None,
+        text_reference_count: 0,
+        text_refs_report_path: None,
+        text_reference_findings: Vec::new(),
     })
 }
 
@@ -1008,6 +1477,13 @@ fn execute_restore(backup_file: &Path) -> Result<MigrationReport> {
         backup_paths: vec![backup_file.to_path_buf()],
         dry_run: false,
         nothing_to_do: false,
+        relink_failures: Vec::new(),
+        relink_candidates: Vec::new(),
+        relinked_count: 0,
+        relink_log_path: None,
+        text_reference_count: 0,
+        text_refs_report_path: None,
+        text_reference_findings: Vec::new(),
     })
 }
 
@@ -1023,6 +1499,8 @@ mod tests {
             force: false,
             no_backup: true,
             session_only: false,
+            relink: false,
+            scan_root: Vec::new(),
         }
     }
 
@@ -1032,6 +1510,8 @@ mod tests {
             force: false,
             no_backup: true,
             session_only: false,
+            relink: false,
+            scan_root: Vec::new(),
         }
     }
 
@@ -1515,6 +1995,8 @@ mod tests {
             force: false,
             no_backup: true,
             session_only: true,
+            relink: false,
+            scan_root: Vec::new(),
         }
     }
 
@@ -1524,6 +2006,8 @@ mod tests {
             force: false,
             no_backup: true,
             session_only: true,
+            relink: false,
+            scan_root: Vec::new(),
         }
     }
 
@@ -1959,6 +2443,1078 @@ mod tests {
         }
     }
 
+    fn relink_opts(scan_root: Vec<PathBuf>) -> MigrateOpts {
+        MigrateOpts {
+            dry_run: false,
+            force: false,
+            no_backup: true,
+            session_only: false,
+            relink: true,
+            scan_root,
+        }
+    }
+
+    fn relink_dry_run_opts(scan_root: Vec<PathBuf>) -> MigrateOpts {
+        MigrateOpts {
+            dry_run: true,
+            force: false,
+            no_backup: true,
+            session_only: false,
+            relink: true,
+            scan_root,
+        }
+    }
+
+    #[test]
+    fn relink_repoints_absolute_link() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            fs.read_link(Path::new("/outside/link")).unwrap(),
+            PathBuf::from("/home/user/new-project/target.txt")
+        );
+    }
+
+    #[test]
+    fn relink_keeps_relative_link_relative() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/home/user/somewhere/sub"));
+        // From /home/user/somewhere/sub, "../../old-project/target.txt"
+        // resolves to /home/user/old-project/target.txt.
+        fs.add_symlink(
+            Path::new("/home/user/somewhere/sub/link"),
+            Path::new("../../old-project/target.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/home/user/somewhere")]),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let written = fs
+            .read_link(Path::new("/home/user/somewhere/sub/link"))
+            .unwrap();
+        assert!(written.is_relative(), "{}", written.display());
+        assert_eq!(
+            written,
+            PathBuf::from("../../new-project/target.txt"),
+            "{}",
+            written.display()
+        );
+    }
+
+    #[test]
+    fn relink_repoints_self_link_at_new_location() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_dir(Path::new("/home/user/old-project/.claude/lib"));
+        fs.add_file(
+            Path::new("/home/user/old-project/.claude/lib/real-tool"),
+            "content",
+        );
+        fs.add_symlink(
+            Path::new("/home/user/old-project/.claude/bin/tool"),
+            Path::new("/home/user/old-project/.claude/lib/real-tool"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/home/user/old-project")]),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        assert!(
+            !fs.is_symlink(Path::new("/home/user/old-project/.claude/bin/tool")),
+            "old path must be gone; the whole project directory moved"
+        );
+        assert_eq!(
+            fs.read_link(Path::new("/home/user/new-project/.claude/bin/tool"))
+                .unwrap(),
+            PathBuf::from("/home/user/new-project/.claude/lib/real-tool")
+        );
+    }
+
+    #[test]
+    fn relink_skips_link_that_was_already_dead() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        // /home/user/old-project/gone.txt was never registered — dead before
+        // the Move.
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/gone.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            fs.read_link(Path::new("/outside/link")).unwrap(),
+            PathBuf::from("/home/user/old-project/gone.txt"),
+            "a link dead before the Move is not this Run's business"
+        );
+    }
+
+    #[test]
+    fn relink_does_nothing_when_move_fails() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+        // The rename can never succeed: the target's parent directory
+        // refuses writes.
+        fs.add_dir(Path::new("/readonly-dest"));
+        fs.add_readonly_dir(Path::new("/readonly-dest"));
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/readonly-dest/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        let err = cmd.execute(&fs, claude_home).unwrap_err();
+
+        assert!(err.to_string().contains("nothing was changed"), "{err}");
+        assert_eq!(
+            fs.read_link(Path::new("/outside/link")).unwrap(),
+            PathBuf::from("/home/user/old-project/target.txt"),
+            "a failed Move must relink nothing"
+        );
+    }
+
+    /// Two units in one batch, joined by a link that lives inside unit A's
+    /// source tree and points into unit B's source tree — not a link outside
+    /// both, matching only one unit's substitution, which any per-unit scan
+    /// would still catch on that unit's own turn regardless of the other's.
+    /// Here, whether the link is found *at all* depends on a *sibling* unit's
+    /// rename: a scan that ran after A had already renamed itself away would
+    /// find nothing left at `/home/user/a/...` to scan, and would never
+    /// discover this link, let alone repoint it. Only a scan that runs before
+    /// every rename in the batch finds it.
+    #[test]
+    fn relink_scans_before_any_rename_in_batch() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/a", "/home/user/.claude");
+        setup_project(&fs, "/home/user/b", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/b/marker.txt"), "content");
+        fs.add_symlink(
+            Path::new("/home/user/a/.claude/link"),
+            Path::new("/home/user/b/marker.txt"),
+        );
+        fs.add_dir(Path::new("/home/user/dest"));
+
+        let moves = vec![
+            batch::Move {
+                source: PathBuf::from("/home/user/a"),
+                target: PathBuf::from("/home/user/dest/a"),
+                line: None,
+            },
+            batch::Move {
+                source: PathBuf::from("/home/user/b"),
+                target: PathBuf::from("/home/user/dest/b"),
+                line: None,
+            },
+        ];
+
+        Command::Batch {
+            moves,
+            opts: relink_opts(vec![PathBuf::from("/home/user/a")]),
+        }
+        .execute(&fs, claude_home)
+        .unwrap();
+
+        assert_eq!(
+            fs.read_link(Path::new("/home/user/dest/a/.claude/link"))
+                .unwrap(),
+            PathBuf::from("/home/user/dest/b/marker.txt"),
+            "the link's target was alive before the batch started, regardless of which unit's \
+             rename ran first — a scan after A's rename would never have found this link at all"
+        );
+    }
+
+    /// A link in a read-only directory cannot be written; the run must not
+    /// stop there — the rename already landed, and a link elsewhere is
+    /// demonstrably still repointed afterwards.
+    #[test]
+    fn relink_continues_after_write_failure() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+
+        fs.add_dir(Path::new("/readonly"));
+        fs.add_readonly_dir(Path::new("/readonly"));
+        fs.add_symlink(
+            Path::new("/readonly/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/readonly"), PathBuf::from("/outside")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            report.relink_failures.len(),
+            1,
+            "{:?}",
+            report.relink_failures
+        );
+        assert_eq!(
+            fs.read_link(Path::new("/readonly/link")).unwrap(),
+            PathBuf::from("/home/user/old-project/target.txt"),
+            "a write failure must not silently succeed"
+        );
+        assert_eq!(
+            fs.read_link(Path::new("/outside/link")).unwrap(),
+            PathBuf::from("/home/user/new-project/target.txt"),
+            "a link elsewhere must still be repointed despite the failure"
+        );
+    }
+
+    #[test]
+    fn relink_write_failure_sets_exit_code() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+
+        fs.add_dir(Path::new("/readonly"));
+        fs.add_readonly_dir(Path::new("/readonly"));
+        fs.add_symlink(
+            Path::new("/readonly/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/readonly")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            report.relink_failures.len(),
+            1,
+            "{:?}",
+            report.relink_failures
+        );
+        assert_eq!(
+            report.exit_code(),
+            1,
+            "a genuine write failure from replace_symlink must set a non-zero exit code"
+        );
+    }
+
+    /// A run that repoints links in other people's projects has to say so.
+    /// The dry run lists its candidates, but a real run used to report
+    /// nothing at all: no count, and no pointer to the Relink Log, which is
+    /// the only record that those foreign trees were written to.
+    #[test]
+    fn real_run_reports_how_many_links_it_repointed_and_where_the_log_is() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert!(!report.dry_run);
+        assert_eq!(report.relinked_count, 1);
+        let log_path = report
+            .relink_log_path
+            .as_ref()
+            .expect("a real run names the relink log it wrote");
+        assert!(
+            log_path.to_string_lossy().ends_with(".relink.tsv"),
+            "{}",
+            log_path.display()
+        );
+        assert!(
+            fs.get_file(log_path).is_some(),
+            "the reported path must be the file that was actually written"
+        );
+    }
+
+    /// Nothing repointed, nothing to announce — and no log path pointing at a
+    /// file that was never written.
+    #[test]
+    fn run_without_relink_reports_no_repointed_links() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: default_opts(),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(report.relinked_count, 0);
+        assert!(report.relink_log_path.is_none());
+    }
+
+    #[test]
+    fn relink_log_records_every_change() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        let log_path = logs
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with(".relink.tsv"))
+            .expect("relink log written");
+        let content = fs.get_file(log_path).unwrap();
+
+        assert_eq!(
+            content,
+            "/outside/link\t/home/user/old-project/target.txt\t/home/user/new-project/target.txt\n"
+        );
+    }
+
+    /// `write_relink_log` must not just transcribe `entries` in arrival
+    /// order — the same argument `text_refs_report`'s sort documents: the
+    /// scan feeding these rows runs its Scan Roots through a `par_iter`, so
+    /// nothing else gives them a stable order. Entries are handed in
+    /// deliberately out of path order so this assertion would fail if the
+    /// sort were dropped and they were written back exactly as given.
+    #[test]
+    fn write_relink_log_sorts_rows_by_path() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        let state = scanner::scan(&fs, Path::new("/home/user/old-project"), claude_home).unwrap();
+        let unit = Unit::from_state(
+            Path::new("/home/user/old-project"),
+            Path::new("/home/user/new-project"),
+            state,
+        )
+        .unwrap();
+        let migration =
+            Migration::from_units(&fs, vec![unit], claude_home, &relink_opts(Vec::new())).unwrap();
+
+        let entries = vec![
+            RelinkLogEntry {
+                path: PathBuf::from("/outside/c"),
+                old: PathBuf::from("/old/c"),
+                new: PathBuf::from("/new/c"),
+            },
+            RelinkLogEntry {
+                path: PathBuf::from("/outside/a"),
+                old: PathBuf::from("/old/a"),
+                new: PathBuf::from("/new/a"),
+            },
+            RelinkLogEntry {
+                path: PathBuf::from("/outside/b"),
+                old: PathBuf::from("/old/b"),
+                new: PathBuf::from("/new/b"),
+            },
+        ];
+
+        migration.write_relink_log(&entries, &[]).unwrap();
+
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        let log_path = logs
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with(".relink.tsv"))
+            .expect("relink log written");
+        let content = fs.get_file(log_path).unwrap();
+
+        assert_eq!(
+            content,
+            "/outside/a\t/old/a\t/new/a\n/outside/b\t/old/b\t/new/b\n/outside/c\t/old/c\t/new/c\n"
+        );
+    }
+
+    /// The Relink Log is the only way back into a foreign project ccmv wrote
+    /// to — CONTEXT.md's *Relink Log*: "der einzige Nachweis darüber, dass
+    /// ccmv in fremde Projekte geschrieben hat". For a relative link that
+    /// travels with its own project (its own path is rebased by the same
+    /// Move, one directory deeper than before), the README's rollback line,
+    /// `ln -sfn "$old" "$path"`, must recreate the link's *pre-Move*
+    /// resolution — not some other path that merely shares a name.
+    ///
+    /// `a` holds a relative link into `b`; both move in the same batch, `a`
+    /// one segment deeper than before, `b` unchanged in depth relative to
+    /// `a`'s new location — exactly the shape that breaks a *raw* old target
+    /// carried over to the new path.
+    #[test]
+    fn relink_log_old_column_survives_the_readme_rollback() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/a", "/home/user/.claude");
+        setup_project(&fs, "/home/user/b", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/b/marker.txt"), "content");
+        // From /home/user/a/.claude, "../../b/marker.txt" resolves to
+        // /home/user/b/marker.txt. The link's own path (under a) and its
+        // target (under b) belong to two *different* Substitution entries,
+        // so this is a candidate — not the excluded self-referential case,
+        // which only excludes a link and its target moving under the *same*
+        // entry.
+        fs.add_symlink(
+            Path::new("/home/user/a/.claude/link"),
+            Path::new("../../b/marker.txt"),
+        );
+        fs.add_dir(Path::new("/home/user/dest"));
+
+        let moves = vec![
+            batch::Move {
+                source: PathBuf::from("/home/user/a"),
+                target: PathBuf::from("/home/user/dest/a"),
+                line: None,
+            },
+            batch::Move {
+                source: PathBuf::from("/home/user/b"),
+                target: PathBuf::from("/home/user/dest/b"),
+                line: None,
+            },
+        ];
+
+        Command::Batch {
+            moves,
+            opts: relink_opts(vec![PathBuf::from("/home/user/a")]),
+        }
+        .execute(&fs, claude_home)
+        .unwrap();
+
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        let log_path = logs
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with(".relink.tsv"))
+            .expect("relink log written");
+        let content = fs.get_file(log_path).unwrap();
+        let row = content.lines().next().expect("one relink row");
+        let mut columns = row.split('\t');
+        let path = PathBuf::from(columns.next().unwrap());
+        let old = PathBuf::from(columns.next().unwrap());
+
+        // Simulate the README's documented rollback line. (b itself moved
+        // away as part of this same run, so /home/user/b/marker.txt no
+        // longer exists on disk — that is the Move working as intended, not
+        // this assertion's concern. What matters is that recreating the
+        // link with the logged `old` reproduces the *string* the link
+        // resolved to before the Move, not some other location that merely
+        // shares a name.)
+        fs.replace_symlink(&path, &old).unwrap();
+
+        assert_eq!(
+            fs.read_link(&path).unwrap(),
+            PathBuf::from("/home/user/b/marker.txt"),
+            "the rolled-back link must resolve exactly where the original did before the Move"
+        );
+    }
+
+    /// The rename and the relink it enabled have both already landed by the
+    /// time the log is written — an error writing the log itself must not
+    /// discard that report, nor abort with a hard `Err`: it joins
+    /// `relink_failures` like any other partial failure, and the run still
+    /// returns `Ok`.
+    #[test]
+    fn relink_log_failure_is_reported_not_fatal() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+        // The Relink Log's own directory refuses writes — the log can't be
+        // written, even though the rename and the relink into `/outside/link`
+        // already succeeded.
+        fs.add_readonly_dir(Path::new("/home/user/.claude/backups/ccmv"));
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            report.relink_failures.len(),
+            1,
+            "{:?}",
+            report.relink_failures
+        );
+        assert_ne!(report.exit_code(), 0);
+        assert_eq!(
+            fs.read_link(Path::new("/outside/link")).unwrap(),
+            PathBuf::from("/home/user/new-project/target.txt"),
+            "the relink itself must still have landed despite the log write failing"
+        );
+    }
+
+    /// No candidates changed — the scan found nothing alive to repoint. An
+    /// empty log file would read as a failed run, not a quiet one.
+    #[test]
+    fn relink_log_absent_when_nothing_changed() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_dir(Path::new("/outside"));
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        assert!(logs.is_empty(), "{logs:?}");
+    }
+
+    /// With no backup archive to borrow a timestamp from, the log is still
+    /// written — and, per the plan's "dann mit eigenem Zeitstempel", carries
+    /// a timestamp of its own, in the same `{encoded}-{YYYYMMDD-HHMMSS}`
+    /// shape `relink_log_shares_backup_timestamp` checks for the "has a
+    /// backup" case.
+    #[test]
+    fn relink_log_written_with_no_backup() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        // relink_opts already sets no_backup: true — no archive is created,
+        // so relink_log_path has nothing to borrow a timestamp from.
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        cmd.execute(&fs, claude_home).unwrap();
+
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        let log_path = logs
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with(".relink.tsv"))
+            .expect("relink log written even without a backup archive");
+
+        let encoded = crate::encoder::encode(Path::new("/home/user/old-project")).unwrap();
+        let file_name = log_path.file_name().unwrap().to_string_lossy();
+        let timestamp = file_name
+            .strip_prefix(&format!("{encoded}-"))
+            .and_then(|rest| rest.strip_suffix(".relink.tsv"))
+            .unwrap_or_else(|| {
+                panic!("expected {{encoded}}-{{timestamp}}.relink.tsv, got {file_name}")
+            });
+        assert_eq!(
+            timestamp.len(),
+            "20260101-000000".len(),
+            "expected a YYYYMMDD-HHMMSS timestamp of its own, got {file_name}"
+        );
+        assert!(
+            timestamp.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "expected a YYYYMMDD-HHMMSS timestamp of its own, got {file_name}"
+        );
+    }
+
+    /// The Relink Log shares its `{encoded}-{timestamp}` name with the run's
+    /// backup archive, so the two are visibly a pair without a manifest.
+    ///
+    /// Exercised directly against `relink_log_path` rather than through a
+    /// full `Command::execute`: both the archive name and the log's
+    /// "no backup" fallback name are derived from the same moving project,
+    /// so an end-to-end comparison of the two filenames would pass even if
+    /// the log stopped reusing the archive's name — nothing forces them
+    /// apart. A crafted, unrelated backup filename does.
+    #[test]
+    fn relink_log_shares_backup_timestamp() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        let state = scanner::scan(&fs, Path::new("/home/user/old-project"), claude_home).unwrap();
+        let unit = Unit::from_state(
+            Path::new("/home/user/old-project"),
+            Path::new("/home/user/new-project"),
+            state,
+        )
+        .unwrap();
+        let migration =
+            Migration::from_units(&fs, vec![unit], claude_home, &relink_opts(Vec::new())).unwrap();
+
+        let backup_path =
+            PathBuf::from("/home/user/.claude/backups/ccmv/unrelated-name-20260101-000000.tar.gz");
+        let log_path = migration.relink_log_path(&[backup_path]).unwrap();
+
+        assert_eq!(
+            log_path,
+            PathBuf::from(
+                "/home/user/.claude/backups/ccmv/unrelated-name-20260101-000000.relink.tsv"
+            )
+        );
+    }
+
+    #[test]
+    fn dry_run_lists_candidates_without_writing() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_dry_run_opts(vec![PathBuf::from("/outside")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            report.relink_candidates.len(),
+            1,
+            "{:?}",
+            report.relink_candidates
+        );
+        assert_eq!(
+            fs.read_link(Path::new("/outside/link")).unwrap(),
+            PathBuf::from("/home/user/old-project/target.txt"),
+            "no replace_symlink must have happened"
+        );
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        assert!(
+            logs.iter()
+                .all(|p| !p.to_string_lossy().ends_with(".relink.tsv")),
+            "dry-run must not write a relink log, {logs:?}"
+        );
+    }
+
+    #[test]
+    fn dry_run_lists_self_link_under_old_path() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_dir(Path::new("/home/user/old-project/.claude/lib"));
+        fs.add_file(
+            Path::new("/home/user/old-project/.claude/lib/real-tool"),
+            "content",
+        );
+        fs.add_symlink(
+            Path::new("/home/user/old-project/.claude/bin/tool"),
+            Path::new("/home/user/old-project/.claude/lib/real-tool"),
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_dry_run_opts(vec![PathBuf::from("/home/user/old-project")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(
+            report.relink_candidates.len(),
+            1,
+            "{:?}",
+            report.relink_candidates
+        );
+        assert_eq!(
+            report.relink_candidates[0].old,
+            PathBuf::from("/home/user/old-project/.claude/bin/tool"),
+            "a candidate appears under its OLD path — nothing was moved"
+        );
+        assert_eq!(
+            report.relink_candidates[0].new,
+            PathBuf::from("/home/user/new-project/.claude/lib/real-tool")
+        );
+    }
+
+    /// A second run over the same, already-relinked state must be a no-op —
+    /// see the plan's "Idempotenz": a link that already points at the new
+    /// target falls out of the prefix match and so is not a candidate the
+    /// second time around.
+    #[test]
+    fn relink_second_run_reports_no_changes() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_file(Path::new("/home/user/old-project/target.txt"), "content");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_symlink(
+            Path::new("/outside/link"),
+            Path::new("/home/user/old-project/target.txt"),
+        );
+
+        let first = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        first.execute(&fs, claude_home).unwrap();
+        let logs_after_first = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        let log_path = logs_after_first
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with(".relink.tsv"))
+            .expect("the first run must have written a log")
+            .clone();
+        // `artifact_log_path` names the log from the source path and a
+        // second-granularity timestamp, so a second run over the same move
+        // lands on the very same file name: a plain "does a .relink.tsv
+        // still exist, exactly one of them" count can't tell a quiet second
+        // run apart from one that re-wrote this same file with identical
+        // content. `write_count` on this exact path can: it only goes up
+        // when `write_atomically` is actually called again.
+        assert_eq!(
+            fs.write_count(&log_path),
+            1,
+            "sanity: the first run must have written the log exactly once"
+        );
+
+        // Same invocation again: the old source path is gone, and
+        // /outside/link already points at the new target.
+        let second = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        let report = second.execute(&fs, claude_home).unwrap();
+
+        assert!(
+            report.relink_candidates.is_empty(),
+            "{:?}",
+            report.relink_candidates
+        );
+        assert!(
+            report.relink_failures.is_empty(),
+            "{:?}",
+            report.relink_failures
+        );
+        assert_eq!(
+            fs.read_link(Path::new("/outside/link")).unwrap(),
+            PathBuf::from("/home/user/new-project/target.txt"),
+            "the second run must not touch an already-relinked link"
+        );
+        assert_eq!(
+            fs.write_count(&log_path),
+            1,
+            "the second run must not rewrite the relink log at all — a regression that \
+             re-matches the link and repoints it at the identical target would still bump this, \
+             even though the file's final contents look unchanged"
+        );
+    }
+
+    /// Wiring test for `Migration::scan_relink_candidates` /
+    /// `write_text_refs_log`: a Text Reference found during a real
+    /// `--relink` run lands in a `.textrefs.tsv` file next to the Relink
+    /// Log, sharing its `{encoded}-{timestamp}` name.
+    #[test]
+    fn text_refs_log_records_findings() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_file(
+            Path::new("/outside/config.toml"),
+            "path = \"/home/user/old-project/data\"",
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(report.text_reference_count, 1, "{report:?}");
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        let log_path = logs
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with(".textrefs.tsv"))
+            .expect("text references report written");
+        assert_eq!(
+            Some(log_path.clone()),
+            report.text_refs_report_path,
+            "the report must name the file it actually wrote"
+        );
+        let content = fs.get_file(log_path).unwrap();
+        assert_eq!(
+            content,
+            "/outside/config.toml\t1\t/home/user/old-project\t/home/user/new-project\n"
+        );
+    }
+
+    /// No Text References were found — an empty report file would read as a
+    /// failed run, the same rule `relink_log_absent_when_nothing_changed`
+    /// checks for the Relink Log.
+    #[test]
+    fn text_refs_log_absent_when_nothing_found() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_dir(Path::new("/outside"));
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_opts(vec![PathBuf::from("/outside")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(report.text_reference_count, 0);
+        assert_eq!(report.text_refs_report_path, None);
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        assert!(
+            logs.iter()
+                .all(|p| !p.to_string_lossy().ends_with(".textrefs.tsv")),
+            "{logs:?}"
+        );
+    }
+
+    /// Without `--relink`, the text scan must not run at all — the same
+    /// gate the symlink scan already has. A finding that a `--relink` run
+    /// would have caught here must go completely unreported.
+    #[test]
+    fn text_scan_does_not_run_without_relink_flag() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_file(
+            Path::new("/outside/config.toml"),
+            "path = \"/home/user/old-project/data\"",
+        );
+        // Same Scan Root a --relink run would use — only `relink` itself is
+        // off, so a leftover scan would still have somewhere to look.
+        let mut opts = relink_opts(vec![PathBuf::from("/outside")]);
+        opts.relink = false;
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts,
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(report.text_reference_count, 0);
+        assert_eq!(report.text_refs_report_path, None);
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        assert!(
+            logs.iter()
+                .all(|p| !p.to_string_lossy().ends_with(".textrefs.tsv")),
+            "{logs:?}"
+        );
+    }
+
+    /// Under `--dry-run` the report still counts what it found, in the
+    /// style of the rest of the dry-run output, but writes nothing — see
+    /// `dry_run_lists_candidates_without_writing` for the same rule applied
+    /// to Relink Candidates.
+    #[test]
+    fn text_refs_dry_run_reports_count_without_writing() {
+        let fs = MockFs::new();
+        let claude_home = Path::new("/home/user/.claude");
+        setup_project(&fs, "/home/user/old-project", "/home/user/.claude");
+        fs.add_dir(Path::new("/outside"));
+        fs.add_file(
+            Path::new("/outside/config.toml"),
+            "path = \"/home/user/old-project/data\"",
+        );
+
+        let cmd = Command::Move {
+            source: PathBuf::from("/home/user/old-project"),
+            target: PathBuf::from("/home/user/new-project"),
+            opts: relink_dry_run_opts(vec![PathBuf::from("/outside")]),
+        };
+        let report = cmd.execute(&fs, claude_home).unwrap();
+
+        assert_eq!(report.text_reference_count, 1, "{report:?}");
+        assert_eq!(report.text_refs_report_path, None);
+        // The count alone is not the report: under --dry-run there is no
+        // file to point at, so the findings themselves must ride along on
+        // the report, the same way relink_candidates does for symlinks.
+        assert_eq!(
+            report.text_reference_findings.len(),
+            1,
+            "{:?}",
+            report.text_reference_findings
+        );
+        assert_eq!(
+            report.text_reference_findings[0].file,
+            PathBuf::from("/outside/config.toml")
+        );
+        assert_eq!(
+            report.text_reference_findings[0].old,
+            "/home/user/old-project"
+        );
+        assert_eq!(
+            report.text_reference_findings[0].new,
+            "/home/user/new-project"
+        );
+        let logs = fs
+            .list_dir_recursive(&claude_home.join("backups/ccmv"))
+            .unwrap();
+        assert!(
+            logs.iter()
+                .all(|p| !p.to_string_lossy().ends_with(".textrefs.tsv")),
+            "dry-run must not write a text references report, {logs:?}"
+        );
+    }
+
+    fn text_reference(file: &str, line: usize) -> links::TextReference {
+        links::TextReference {
+            file: PathBuf::from(file),
+            line,
+            old: "/x/proj".to_owned(),
+            new: "/y/proj".to_owned(),
+        }
+    }
+
+    /// The scan that feeds `text_refs_report` runs its two files through a
+    /// `par_iter`, so nothing hands them to the report in file order. If the
+    /// report just echoed `findings` as given, b.toml's row would sit before
+    /// a.toml's, and a.toml's own two rows would not be adjacent.
+    #[test]
+    fn report_groups_findings_by_file() {
+        let findings = vec![
+            text_reference("/outside/b.toml", 1),
+            text_reference("/outside/a.toml", 5),
+            text_reference("/outside/a.toml", 2),
+        ];
+
+        let report = text_refs_report(&findings);
+
+        assert_eq!(
+            report.lines().collect::<Vec<_>>(),
+            vec![
+                "/outside/a.toml\t2\t/x/proj\t/y/proj",
+                "/outside/a.toml\t5\t/x/proj\t/y/proj",
+                "/outside/b.toml\t1\t/x/proj\t/y/proj",
+            ]
+        );
+    }
+
+    /// The first column is the full absolute path, not a name relative to
+    /// some root — a consumer greps for one project's rows by that prefix,
+    /// and a shortened or relative path would make the filter miss them.
+    #[test]
+    fn report_is_filterable_by_project_prefix() {
+        let findings = vec![
+            text_reference("/home/user/project-a/notes.md", 1),
+            text_reference("/home/user/project-b/notes.md", 1),
+        ];
+
+        let report = text_refs_report(&findings);
+        let project_a_rows: Vec<&str> = report
+            .lines()
+            .filter(|line| line.starts_with("/home/user/project-a"))
+            .collect();
+
+        assert_eq!(
+            project_a_rows,
+            vec!["/home/user/project-a/notes.md\t1\t/x/proj\t/y/proj"]
+        );
+    }
+
+    #[test]
+    fn report_columns_are_file_line_old_new() {
+        let findings = vec![text_reference("/outside/config.toml", 3)];
+
+        let report = text_refs_report(&findings);
+        let columns: Vec<&str> = report.trim_end().split('\t').collect();
+
+        assert_eq!(
+            columns,
+            vec!["/outside/config.toml", "3", "/x/proj", "/y/proj"]
+        );
+    }
+
     fn cli_with_paths(paths: Vec<PathBuf>) -> crate::cli::Cli {
         crate::cli::Cli {
             command: None,
@@ -1969,6 +3525,8 @@ mod tests {
             force: false,
             no_backup: false,
             session_only: false,
+            relink: false,
+            scan_root: Vec::new(),
         }
     }
 

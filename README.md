@@ -115,6 +115,30 @@ Moves only the session data — global `projects/{encoded}/`, jsonl `cwd` fields
 
 Use case: point a session started in a git worktree back at the parent repo, then drop the worktree. The source path does not need to still exist on disk; only its session data under `~/.claude/` is required.
 
+### Relink and text references
+
+```bash
+ccmv --relink ~/projects/myapp ~/work/
+```
+
+Repoints symlinks elsewhere on disk that point into the moved project. By default the scan covers the `.claude/` tree of every project registered in `~/.claude.json`; `--scan-root` adds more trees, on top of that default set:
+
+```bash
+ccmv --relink --scan-root ~/work/vendor/cef ~/projects/myapp ~/work/
+```
+
+An absolute path to the moved project written into a file's *contents* — a text reference, as opposed to a symlink target — is reported, never rewritten. Rewriting a string inside a file ccmv doesn't own needs judgement the tool doesn't have.
+
+The run's relink log lands next to its backup archive, `~/.claude/backups/ccmv/{encoded}-{timestamp}.relink.tsv` (its own timestamp under `--no-backup`, since there is then no archive to share a name with) — one `path<TAB>old<TAB>new` row per repointed link. To put every link back:
+
+```bash
+while IFS=$'\t' read -r path old _; do ln -sfn "$old" "$path"; done < ~/.claude/backups/ccmv/<name>.relink.tsv
+```
+
+Text references land the same way, at `...textrefs.tsv` instead of `...relink.tsv`, as `file<TAB>line<TAB>old<TAB>new` rows.
+
+Two limits: a link that was already dead before the move is left alone, and `--relink` cannot be combined with `--session-only` — relinking needs both the old and the new path from the same run.
+
 ### Flags
 
 | Flag | Short | Description |
@@ -125,6 +149,8 @@ Use case: point a session started in a git worktree back at the parent repo, the
 | `--force` | | Overwrite if target already has Claude Code data |
 | `--no-backup` | | Skip automatic backup |
 | `--session-only` | | Migrate only session data, leave project directories untouched |
+| `--relink` | | Repoint symlinks elsewhere on disk that point into the moved project |
+| `--scan-root <DIR>` | | Additional directory to scan for such symlinks (repeatable) |
 
 Flags go before positional arguments: `ccmv -n source target`
 

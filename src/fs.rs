@@ -19,7 +19,6 @@ pub trait Fs: Send + Sync {
     fn is_dir(&self, path: &Path) -> bool;
     /// The raw target of a symlink, unresolved — a relative target comes
     /// back relative.
-    #[allow(dead_code)]
     fn read_link(&self, path: &Path) -> Result<PathBuf>;
     /// Whether `path` is a symlink, including a dangling one.
     #[allow(dead_code)]
@@ -28,12 +27,9 @@ pub trait Fs: Send + Sync {
     /// created under a temporary name in the same directory, then renamed
     /// over `path`. A `remove` followed by a `symlink` would leave a hole if
     /// interrupted in between.
-    #[allow(dead_code)]
     fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()>;
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
-    #[allow(dead_code)]
     fn list_dir_recursive(&self, path: &Path) -> Result<Vec<PathBuf>>;
-    #[allow(dead_code)]
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     #[allow(dead_code)]
     fn remove_dir_all(&self, path: &Path) -> Result<()>;
@@ -146,10 +142,26 @@ impl Fs for RealFs {
             .to_string_lossy();
         let tmp_path = parent.join(format!(".ccmv-relink-{file_name}-{}", std::process::id()));
 
+        // A leftover from an interrupted earlier run under the same PID
+        // (PIDs recycle) would make `symlink` below fail with EEXIST and
+        // wedge every later run that touches this path. `remove_file`
+        // removes the symlink entry itself, not whatever it points at.
+        if let Err(error) = std::fs::remove_file(&tmp_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| {
+                format!("clearing stale temporary link at {}", tmp_path.display())
+            });
+        }
+
         symlink(target, &tmp_path)
             .with_context(|| format!("creating temporary symlink at {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, path)
-            .with_context(|| format!("replacing symlink at {}", path.display()))?;
+        if let Err(error) = std::fs::rename(&tmp_path, path) {
+            // The temp link was created but never landed at `path` — remove
+            // it so it doesn't sit there as the next run's stale leftover.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error).with_context(|| format!("replacing symlink at {}", path.display()));
+        }
         Ok(())
     }
 
@@ -325,6 +337,9 @@ impl Fs for MockFs {
     }
 
     fn write_atomically(&self, path: &Path, content: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            self.probe_writable(parent)?;
+        }
         self.files
             .lock()
             .unwrap()
@@ -437,6 +452,9 @@ impl Fs for MockFs {
     }
 
     fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            self.probe_writable(parent)?;
+        }
         self.links
             .lock()
             .unwrap()
@@ -682,6 +700,18 @@ mod tests {
         assert_eq!(fs.read_link(&link).unwrap(), Path::new("relative/target"));
     }
 
+    /// The true case was pinned from the start; nothing pinned the false one,
+    /// so an `is_symlink` that answered yes to everything went unnoticed.
+    #[test]
+    fn is_symlink_false_for_a_regular_file_and_for_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("regular");
+        std::fs::write(&file, "content").unwrap();
+
+        assert!(!RealFs.is_symlink(&file));
+        assert!(!RealFs.is_symlink(&dir.path().join("does-not-exist")));
+    }
+
     /// `metadata` follows the link and fails when the target is missing;
     /// `is_symlink` must use `symlink_metadata` instead so a dangling link is
     /// still reported as a symlink.
@@ -735,6 +765,54 @@ mod tests {
 
         assert_eq!(fs.read_link(&link).unwrap(), Path::new("new-target"));
         assert!(victim_target.join("keep.txt").exists());
+    }
+
+    /// A stale `.ccmv-relink-*` temp link from an interrupted earlier run
+    /// under the same PID (PIDs recycle) must not wedge this one: without
+    /// clearing it first, the `symlink` call inside `replace_symlink` fails
+    /// with EEXIST every time this path is relinked again.
+    #[cfg(unix)]
+    #[test]
+    fn replace_symlink_clears_stale_temp_link_before_creating() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs;
+        let link = dir.path().join("link");
+        symlink("old-target", &link).unwrap();
+        let stale_tmp = dir
+            .path()
+            .join(format!(".ccmv-relink-link-{}", std::process::id()));
+        symlink("leftover-target", &stale_tmp).unwrap();
+
+        fs.replace_symlink(&link, Path::new("new-target")).unwrap();
+
+        assert_eq!(fs.read_link(&link).unwrap(), Path::new("new-target"));
+    }
+
+    /// When the final `rename` fails, the temp link it created must not be
+    /// left behind — otherwise the next call for the same path trips over
+    /// the same EEXIST `replace_symlink_clears_stale_temp_link_before_creating`
+    /// pins.
+    #[cfg(unix)]
+    #[test]
+    fn replace_symlink_removes_temp_link_after_failed_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs;
+        // `rename` cannot replace a directory with a symlink (EISDIR), so
+        // the final rename in `replace_symlink` is guaranteed to fail here.
+        let path = dir.path().join("link");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(fs.replace_symlink(&path, Path::new("new-target")).is_err());
+
+        let tmp_path = dir
+            .path()
+            .join(format!(".ccmv-relink-link-{}", std::process::id()));
+        assert!(
+            std::fs::symlink_metadata(&tmp_path).is_err(),
+            "the temporary symlink must not survive a failed rename"
+        );
     }
 
     #[test]

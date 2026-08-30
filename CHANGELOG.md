@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- `--relink`: repoint symlinks elsewhere on disk that point into the moved project. `--scan-root <DIR>` adds directories to search, on top of every registered project's `.claude/` tree.
+- Text references — absolute paths to the moved project inside a file's contents — are reported in a `.textrefs.tsv`, never rewritten.
+- Relink log (`.relink.tsv`), next to the backup archive, one row per repointed link, for manual rollback.
+
 ## [0.3.0] - 2026-07-19
 
 ### Added

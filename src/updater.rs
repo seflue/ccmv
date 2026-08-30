@@ -60,7 +60,11 @@ impl Substitutions {
     }
 
     /// Longest entry matching at the start of `rest` on a segment boundary.
-    fn match_at(&self, rest: &str) -> Option<(&str, &str)> {
+    ///
+    /// `pub(crate)` so `links::text_references` can scan file contents for
+    /// Text References with the same text-fragment matcher `replace_paths`
+    /// uses, instead of a second implementation of the same rule.
+    pub(crate) fn match_at(&self, rest: &str) -> Option<(&str, &str)> {
         let first = *rest.as_bytes().first()?;
         if !self.first_bytes[first as usize] {
             return None;
@@ -73,24 +77,74 @@ impl Substitutions {
             .map(|(old, new)| (old.as_str(), new.as_str()))
     }
 
-    /// Longest entry whose `old` is `key` itself or a path-prefix of it.
+    /// Longest entry whose `old` is `path` itself or a path-prefix of it.
     ///
-    /// Stricter than `match_at` on purpose: a JSON key is one whole path, so
-    /// only an exact match or a `/`-descendant counts. `match_at` also treats
-    /// a space as a boundary — needed to rewrite hook command strings like
-    /// `cd /old/proj && ...`, but it would wrongly claim the sibling key
-    /// `/old/proj stuff`.
-    fn match_prefix(&self, key: &str) -> Option<(&str, &str)> {
+    /// Stricter than `match_at` on purpose: a whole path — a JSON key, or a
+    /// resolved symlink target as `links::relink_candidate` uses it — is one
+    /// unit, so only an exact match or a `/`-descendant counts. `match_at`
+    /// also treats a space as a boundary — needed to rewrite hook command
+    /// strings like `cd /old/proj && ...`, but it would wrongly claim the
+    /// sibling key `/old/proj stuff`.
+    pub(crate) fn match_prefix(&self, path: &str) -> Option<(&str, &str)> {
         self.entries
             .iter()
             .find(|(old, _)| {
-                key == old
-                    || (key.len() > old.len()
-                        && key.as_bytes()[old.len()] == b'/'
-                        && key.starts_with(old.as_str()))
+                path == old
+                    || (path.len() > old.len()
+                        && path.as_bytes()[old.len()] == b'/'
+                        && path.starts_with(old.as_str()))
             })
             .map(|(old, new)| (old.as_str(), new.as_str()))
     }
+
+    /// `match_prefix` over a filesystem `Path`, wrapping the lossy
+    /// `Path`-to-`str` conversion once so callers don't degrade a `PathBuf`
+    /// via `to_string_lossy()` themselves at every call site.
+    pub(crate) fn match_path(&self, path: &Path) -> Option<(&str, &str)> {
+        self.match_prefix(&path.to_string_lossy())
+    }
+
+    /// `match_path`, applied: `path`'s matching prefix swapped for its
+    /// replacement, `None` when nothing matches. The rebase itself —
+    /// `format!("{new}{}", &path[old.len()..])` — used to be written out by
+    /// hand at every call site (`links::relink_candidate`,
+    /// `Migration::repoint_candidates`, `rename_json_keys`); one copy here is
+    /// what all three now share.
+    pub(crate) fn rebase(&self, path: &Path) -> Option<PathBuf> {
+        let (old, new) = self.match_path(path)?;
+        let path_str = path.to_string_lossy();
+        Some(PathBuf::from(format!("{new}{}", &path_str[old.len()..])))
+    }
+}
+
+/// Scans `content` left to right for every Substitution match, yielding one
+/// `(byte offset, old, new)` per hit, offsets increasing. Both `replace_paths`
+/// (which rebuilds `content` around each hit) and
+/// `links::text_references_in_content` (which turns offsets into line
+/// numbers) walk this same sequence of matches, instead of each carrying its
+/// own copy of the match-and-advance loop — a doc comment claiming the two
+/// "always agree" is not the same as them sharing the code that decides it.
+pub(crate) fn scan_matches<'a>(
+    content: &'a str,
+    subs: &'a Substitutions,
+) -> impl Iterator<Item = (usize, &'a str, &'a str)> {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < content.len() {
+            let rest = &content[i..];
+            if let Some((old, new)) = subs.match_at(rest) {
+                let offset = i;
+                i += old.len();
+                return Some((offset, old, new));
+            }
+            let c = rest
+                .chars()
+                .next()
+                .expect("loop guard keeps rest non-empty");
+            i += c.len_utf8();
+        }
+        None
+    })
 }
 
 /// Applies every substitution in `subs` in a single left-to-right pass,
@@ -102,23 +156,15 @@ impl Substitutions {
 fn replace_paths(content: &str, subs: &Substitutions) -> (usize, String) {
     let mut out = String::with_capacity(content.len());
     let mut count = 0;
-    let mut i = 0;
+    let mut last = 0;
 
-    while i < content.len() {
-        let rest = &content[i..];
-        if let Some((old, new)) = subs.match_at(rest) {
-            out.push_str(new);
-            count += 1;
-            i += old.len();
-        } else {
-            let c = rest
-                .chars()
-                .next()
-                .expect("loop guard keeps rest non-empty");
-            out.push(c);
-            i += c.len_utf8();
-        }
+    for (offset, old, new) in scan_matches(content, subs) {
+        out.push_str(&content[last..offset]);
+        out.push_str(new);
+        count += 1;
+        last = offset + old.len();
     }
+    out.push_str(&content[last..]);
 
     (count, out)
 }
@@ -221,8 +267,8 @@ pub fn rename_json_keys(
     let renames: Vec<(String, String)> = obj
         .keys()
         .filter_map(|k| {
-            let (old, new) = subs.match_prefix(k)?;
-            Some((k.clone(), format!("{new}{}", &k[old.len()..])))
+            let new_key = subs.rebase(Path::new(k))?;
+            Some((k.clone(), new_key.to_string_lossy().into_owned()))
         })
         .collect();
 
