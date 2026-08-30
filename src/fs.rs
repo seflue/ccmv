@@ -17,6 +17,19 @@ pub trait Fs: Send + Sync {
     fn probe_writable(&self, dir: &Path) -> Result<()>;
     fn exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
+    /// The raw target of a symlink, unresolved — a relative target comes
+    /// back relative.
+    #[allow(dead_code)]
+    fn read_link(&self, path: &Path) -> Result<PathBuf>;
+    /// Whether `path` is a symlink, including a dangling one.
+    #[allow(dead_code)]
+    fn is_symlink(&self, path: &Path) -> bool;
+    /// Repoints the symlink at `path` to `target`, atomically: a new link is
+    /// created under a temporary name in the same directory, then renamed
+    /// over `path`. A `remove` followed by a `symlink` would leave a hole if
+    /// interrupted in between.
+    #[allow(dead_code)]
+    fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()>;
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
     #[allow(dead_code)]
     fn list_dir_recursive(&self, path: &Path) -> Result<Vec<PathBuf>>;
@@ -110,6 +123,43 @@ impl Fs for RealFs {
         path.is_dir()
     }
 
+    fn read_link(&self, path: &Path) -> Result<PathBuf> {
+        std::fs::read_link(path).with_context(|| format!("reading symlink {}", path.display()))
+    }
+
+    /// `metadata` follows a symlink and fails when its target is missing;
+    /// `symlink_metadata` does not, so a dangling link still reports true.
+    fn is_symlink(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    #[cfg(unix)]
+    fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let parent = path
+            .parent()
+            .with_context(|| format!("no parent directory for {}", path.display()))?;
+        let file_name = path
+            .file_name()
+            .with_context(|| format!("no file name for {}", path.display()))?
+            .to_string_lossy();
+        let tmp_path = parent.join(format!(".ccmv-relink-{file_name}-{}", std::process::id()));
+
+        symlink(target, &tmp_path)
+            .with_context(|| format!("creating temporary symlink at {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("replacing symlink at {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Without `std::os::unix::fs::symlink` there is no portable way to
+    /// create a symlink pointing at an arbitrary target.
+    #[cfg(not(unix))]
+    fn replace_symlink(&self, _path: &Path, _target: &Path) -> Result<()> {
+        bail!("replace_symlink is only supported on unix")
+    }
+
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
         let mut entries = Vec::new();
         for entry in
@@ -150,7 +200,13 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        // `entry.file_type()` reports the entry itself, without following a
+        // symlink — unlike `path.is_dir()`, which would descend into a
+        // directory link's target.
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type of {}", path.display()))?;
+        if file_type.is_dir() {
             collect_files_recursive(&path, out)?;
         } else {
             out.push(path);
@@ -176,6 +232,8 @@ pub struct MockFs {
     devices: Mutex<HashMap<PathBuf, u64>>,
     /// Directories `probe_writable` refuses.
     readonly: Mutex<HashSet<PathBuf>>,
+    /// Symlink path -> raw (possibly relative) target.
+    links: Mutex<HashMap<PathBuf, PathBuf>>,
 }
 
 #[cfg(test)]
@@ -187,6 +245,7 @@ impl MockFs {
             writes: Mutex::new(HashMap::new()),
             devices: Mutex::new(HashMap::new()),
             readonly: Mutex::new(HashSet::new()),
+            links: Mutex::new(HashMap::new()),
         }
     }
 
@@ -226,6 +285,31 @@ impl MockFs {
     #[allow(dead_code)]
     pub fn get_file(&self, path: &Path) -> Option<String> {
         self.files.lock().unwrap().get(path).cloned()
+    }
+
+    /// Seeds a symlink at `path` with the given raw (possibly relative)
+    /// target.
+    pub fn add_symlink(&self, path: &Path, target: &Path) {
+        self.links
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), target.to_path_buf());
+    }
+
+    /// Follows `links` from `path` through successive hops, stopping at the
+    /// first path that is not itself a link. Bounded so a cycle (link A ->
+    /// link B -> link A) terminates instead of looping forever, the way a
+    /// real filesystem's ELOOP would stop it.
+    fn resolve_symlink_chain(&self, path: &Path) -> PathBuf {
+        let links = self.links.lock().unwrap();
+        let mut current = path.to_path_buf();
+        for _ in 0..40 {
+            match links.get(&current) {
+                Some(target) => current = target.clone(),
+                None => break,
+            }
+        }
+        current
     }
 }
 
@@ -283,6 +367,18 @@ impl Fs for MockFs {
                 dirs.insert(to.join(relative));
             }
 
+            let mut links = self.links.lock().unwrap();
+            let links_to_move: Vec<(PathBuf, PathBuf)> = links
+                .iter()
+                .filter(|(k, _)| k.starts_with(from))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (old_link, target) in links_to_move {
+                links.remove(&old_link);
+                let relative = old_link.strip_prefix(from).unwrap();
+                links.insert(to.join(relative), target);
+            }
+
             return Ok(());
         }
 
@@ -315,16 +411,43 @@ impl Fs for MockFs {
     }
 
     fn exists(&self, path: &Path) -> bool {
-        self.files.lock().unwrap().contains_key(path) || self.dirs.lock().unwrap().contains(path)
+        let resolved = self.resolve_symlink_chain(path);
+        self.files.lock().unwrap().contains_key(&resolved)
+            || self.dirs.lock().unwrap().contains(&resolved)
     }
 
     fn is_dir(&self, path: &Path) -> bool {
-        self.dirs.lock().unwrap().contains(path)
+        self.dirs
+            .lock()
+            .unwrap()
+            .contains(&self.resolve_symlink_chain(path))
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf> {
+        self.links
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .with_context(|| format!("not a symlink: {}", path.display()))
+    }
+
+    fn is_symlink(&self, path: &Path) -> bool {
+        self.links.lock().unwrap().contains_key(path)
+    }
+
+    fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
+        self.links
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), target.to_path_buf());
+        Ok(())
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
         let files = self.files.lock().unwrap();
         let dirs = self.dirs.lock().unwrap();
+        let links = self.links.lock().unwrap();
         let mut entries = Vec::new();
         for file_path in files.keys() {
             if file_path.parent() == Some(path) {
@@ -336,15 +459,26 @@ impl Fs for MockFs {
                 entries.push(dir_path.clone());
             }
         }
+        for link_path in links.keys() {
+            if link_path.parent() == Some(path) {
+                entries.push(link_path.clone());
+            }
+        }
         Ok(entries)
     }
 
     fn list_dir_recursive(&self, path: &Path) -> Result<Vec<PathBuf>> {
         let files = self.files.lock().unwrap();
+        let links = self.links.lock().unwrap();
         let mut result = Vec::new();
         for file_path in files.keys() {
             if file_path.starts_with(path) && file_path != path {
                 result.push(file_path.clone());
+            }
+        }
+        for link_path in links.keys() {
+            if link_path.starts_with(path) && link_path != path {
+                result.push(link_path.clone());
             }
         }
         Ok(result)
@@ -532,6 +666,77 @@ mod tests {
         can_rename(&fs, Path::new("/x/proj"), Path::new("/y/proj")).unwrap();
     }
 
+    /// `std::fs::read_link` returns the target exactly as stored, unresolved.
+    /// Pinned so a later "helpful" `canonicalize` can't sneak in — the relink
+    /// scan needs the raw relative target, not where it currently resolves.
+    #[cfg(unix)]
+    #[test]
+    fn read_link_returns_raw_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs;
+        let link = dir.path().join("link");
+        symlink("relative/target", &link).unwrap();
+
+        assert_eq!(fs.read_link(&link).unwrap(), Path::new("relative/target"));
+    }
+
+    /// `metadata` follows the link and fails when the target is missing;
+    /// `is_symlink` must use `symlink_metadata` instead so a dangling link is
+    /// still reported as a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn is_symlink_true_for_dangling_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs;
+        let link = dir.path().join("link");
+        symlink("/nonexistent/target", &link).unwrap();
+
+        assert!(fs.is_symlink(&link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_symlink_overwrites_existing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs;
+        let link = dir.path().join("link");
+        symlink("old-target", &link).unwrap();
+
+        fs.replace_symlink(&link, Path::new("new-target")).unwrap();
+
+        assert_eq!(fs.read_link(&link).unwrap(), Path::new("new-target"));
+    }
+
+    /// The victim is a symlink *pointing at* a directory, not the directory
+    /// itself. A wrong implementation (e.g. `remove_dir_all` on the old
+    /// target) would delete the target's contents; this pins that it does
+    /// not.
+    #[cfg(unix)]
+    #[test]
+    fn replace_symlink_over_directory_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs;
+        let victim_target = dir.path().join("victim_dir");
+        std::fs::create_dir(&victim_target).unwrap();
+        std::fs::write(victim_target.join("keep.txt"), "content").unwrap();
+
+        let link = dir.path().join("link");
+        symlink(&victim_target, &link).unwrap();
+
+        fs.replace_symlink(&link, Path::new("new-target")).unwrap();
+
+        assert_eq!(fs.read_link(&link).unwrap(), Path::new("new-target"));
+        assert!(victim_target.join("keep.txt").exists());
+    }
+
     #[test]
     fn real_list_dir_recursive() {
         let dir = tempfile::tempdir().unwrap();
@@ -543,5 +748,113 @@ mod tests {
         let mut files = fs.list_dir_recursive(dir.path()).unwrap();
         files.sort();
         assert_eq!(files.len(), 2);
+    }
+
+    /// `collect_files_recursive` used to branch on `path.is_dir()`, which
+    /// follows a symlink into its target and reports the target's contents.
+    /// A directory link must be reported as itself, never descended into.
+    #[cfg(unix)]
+    #[test]
+    fn real_list_dir_recursive_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs;
+        let target = dir.path().join("target_dir");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside.txt"), "content").unwrap();
+
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let link = project.join("link");
+        symlink(&target, &link).unwrap();
+
+        let entries = fs.list_dir_recursive(&project).unwrap();
+
+        assert_eq!(entries, vec![link]);
+    }
+
+    /// Mirrors `Path::exists`, which follows links: a link whose target was
+    /// never registered as a file or directory does not exist.
+    #[test]
+    fn mock_exists_false_for_dangling_link() {
+        let fs = MockFs::new();
+        fs.add_symlink(Path::new("/link"), Path::new("/nonexistent/target"));
+
+        assert!(!fs.exists(Path::new("/link")));
+    }
+
+    #[test]
+    fn mock_is_dir_true_for_link_to_dir() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/real/dir"));
+        fs.add_symlink(Path::new("/link"), Path::new("/real/dir"));
+
+        assert!(fs.is_dir(Path::new("/link")));
+    }
+
+    /// Renaming a directory carries its link entries along, the way the
+    /// existing `rename` already carries `files` and `dirs`.
+    #[test]
+    fn mock_rename_moves_link_entries() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/old"));
+        fs.add_symlink(Path::new("/old/link"), Path::new("some-target"));
+
+        fs.rename(Path::new("/old"), Path::new("/new")).unwrap();
+
+        assert!(fs.is_symlink(Path::new("/new/link")));
+        assert!(!fs.is_symlink(Path::new("/old/link")));
+        assert_eq!(
+            fs.read_link(Path::new("/new/link")).unwrap(),
+            Path::new("some-target")
+        );
+    }
+
+    /// `list_dir` reports a directory link as itself; it must not resolve
+    /// through it and report the target's children instead.
+    #[test]
+    fn mock_list_dir_includes_link_without_descending() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/project"));
+        fs.add_dir(Path::new("/other"));
+        fs.add_file(Path::new("/other/inside.txt"), "content");
+        fs.add_symlink(Path::new("/project/link"), Path::new("/other"));
+
+        let entries = fs.list_dir(Path::new("/project")).unwrap();
+
+        assert_eq!(entries, vec![Path::new("/project/link")]);
+    }
+
+    /// Same as `mock_list_dir_includes_link_without_descending`, one level
+    /// deeper: the link shows up, its target's contents do not.
+    #[test]
+    fn mock_list_dir_recursive_includes_link_without_descending() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/project/sub"));
+        fs.add_dir(Path::new("/other"));
+        fs.add_file(Path::new("/other/inside.txt"), "content");
+        fs.add_symlink(Path::new("/project/sub/link"), Path::new("/other"));
+
+        let entries = fs.list_dir_recursive(Path::new("/project")).unwrap();
+
+        assert_eq!(entries, vec![Path::new("/project/sub/link")]);
+    }
+
+    /// `MockFs` pinning of the same guarantee as
+    /// `real_list_dir_recursive_does_not_follow_symlinks`: a symlink to a
+    /// directory outside the scanned tree is reported as itself, never as
+    /// its target's contents.
+    #[test]
+    fn mock_list_dir_recursive_does_not_follow_symlinks() {
+        let fs = MockFs::new();
+        fs.add_dir(Path::new("/project"));
+        fs.add_dir(Path::new("/target_dir"));
+        fs.add_file(Path::new("/target_dir/inside.txt"), "content");
+        fs.add_symlink(Path::new("/project/link"), Path::new("/target_dir"));
+
+        let entries = fs.list_dir_recursive(Path::new("/project")).unwrap();
+
+        assert_eq!(entries, vec![Path::new("/project/link")]);
     }
 }
