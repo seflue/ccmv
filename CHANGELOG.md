@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-31
+
 ### Added
 
 - `--relink`: repoint symlinks elsewhere on disk that point into the moved project. `--scan-root <DIR>` adds directories to search, on top of every registered project's `.claude/` tree.
